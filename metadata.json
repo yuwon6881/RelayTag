@@ -1,0 +1,6 @@
+{
+  "name": "RelayTag — Privacy Windshield QR & Contact Switch",
+  "description": "Stick a privacy-first QR tag on your car windshield, toggle contact availability on or off anytime, register your vehicle license plate, and exchange anonymous two-way messages.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

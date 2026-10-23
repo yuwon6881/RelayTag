@@ -1,0 +1,323 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1: Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isVerified() && request.auth.uid == userId;
+    }
+
+    // Validation Blueprint: VehicleTag
+    function isValidVehicleTag(data) {
+      return data.keys().hasAll([
+          'code',
+          'ownerId',
+          'vehicleLabel',
+          'plateNumber',
+          'contactEnabled',
+          'autoExpireAt',
+          'statusNote',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'code',
+          'ownerId',
+          'vehicleLabel',
+          'plateNumber',
+          'contactEnabled',
+          'autoExpireAt',
+          'statusNote',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.code is string
+        && data.code.size() >= 4
+        && data.code.size() <= 20
+        && data.code.matches('^[A-Z0-9\\-]+$')
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.vehicleLabel is string
+        && data.vehicleLabel.size() >= 1
+        && data.vehicleLabel.size() <= 60
+        && data.plateNumber is string
+        && data.plateNumber.size() >= 1
+        && data.plateNumber.size() <= 20
+        && data.contactEnabled is bool
+        && data.autoExpireAt is number
+        && data.autoExpireAt >= 0
+        && data.statusNote is string
+        && data.statusNote.size() >= 1
+        && data.statusNote.size() <= 160
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: UserPrivateConfig
+    function isValidUserPrivateConfig(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'email',
+          'telegramEnabled',
+          'telegramBotToken',
+          'telegramChatId',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'email',
+          'telegramEnabled',
+          'telegramBotToken',
+          'telegramChatId',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.email is string
+        && data.email.size() <= 120
+        && data.telegramEnabled is bool
+        && data.telegramBotToken is string
+        && data.telegramBotToken.size() <= 120
+        && data.telegramChatId is string
+        && data.telegramChatId.size() <= 60
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: RelayMessage
+    function isValidRelayMessage(data) {
+      return data.keys().hasAll([
+          'tagCode',
+          'ownerId',
+          'sender',
+          'senderAlias',
+          'text',
+          'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'tagCode',
+          'ownerId',
+          'sender',
+          'senderAlias',
+          'text',
+          'sessionId',
+          'createdAt'
+        ])
+        && data.tagCode is string
+        && data.tagCode.size() >= 4
+        && data.tagCode.size() <= 20
+        && data.tagCode.matches('^[A-Z0-9\\-]+$')
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.sender is string
+        && (data.sender == 'scanner' || data.sender == 'owner')
+        && data.senderAlias is string
+        && data.senderAlias.size() >= 1
+        && data.senderAlias.size() <= 40
+        && data.text is string
+        && data.text.size() >= 1
+        && data.text.size() <= 500
+        && (!('sessionId' in data) || (data.sessionId is string && data.sessionId.size() >= 8 && data.sessionId.size() <= 64 && data.sessionId.matches('^[a-zA-Z0-9_\\-]+$')))
+        && data.createdAt is timestamp;
+    }
+
+    // Validation Blueprint: TagRelayVault (AES-256-GCM encrypted server relay ciphertext)
+    function isValidTagRelayVault(data) {
+      return data.keys().hasAll([
+          'tagCode',
+          'ownerId',
+          'ciphertext',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'tagCode',
+          'ownerId',
+          'ciphertext',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.tagCode is string
+        && data.tagCode.size() >= 4
+        && data.tagCode.size() <= 20
+        && data.tagCode.matches('^[A-Z0-9\\-]+$')
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.ciphertext is string
+        && data.ciphertext.size() >= 16
+        && data.ciphertext.size() <= 1024
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Collection 1: /tags/{tagCode}
+    match /tags/{tagCode} {
+      allow get: if isValidId(tagCode);
+
+      allow list: if isVerified() && existing().ownerId == request.auth.uid;
+
+      allow create: if isVerified()
+        && isValidId(tagCode)
+        && isValidVehicleTag(incoming())
+        && incoming().code == tagCode
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerified()
+        && isValidId(tagCode)
+        && isValidVehicleTag(incoming())
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().code == existing().code
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['contactEnabled', 'autoExpireAt', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['vehicleLabel', 'plateNumber', 'statusNote', 'contactEnabled', 'autoExpireAt', 'updatedAt'])
+        );
+
+      allow delete: if isVerified()
+        && isValidId(tagCode)
+        && existing().ownerId == request.auth.uid;
+
+      // Subcollection: /tags/{tagCode}/vault/{vaultId} (Non-listable, HMAC-ID gated, AES-256-GCM ciphertext)
+      match /vault/{vaultId} {
+        allow get: if isValidId(tagCode)
+          && isValidId(vaultId)
+          && exists(/databases/$(database)/documents/tags/$(tagCode));
+
+        allow list: if false;
+
+        allow create: if isVerified()
+          && isValidId(tagCode)
+          && isValidId(vaultId)
+          && isValidTagRelayVault(incoming())
+          && incoming().tagCode == tagCode
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/tags/$(tagCode))
+          && get(/databases/$(database)/documents/tags/$(tagCode)).data.ownerId == request.auth.uid;
+
+        allow update: if isVerified()
+          && isValidId(tagCode)
+          && isValidId(vaultId)
+          && isValidTagRelayVault(incoming())
+          && existing().ownerId == request.auth.uid
+          && incoming().ownerId == existing().ownerId
+          && incoming().tagCode == existing().tagCode
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['ciphertext', 'updatedAt'])
+          && exists(/databases/$(database)/documents/tags/$(tagCode))
+          && get(/databases/$(database)/documents/tags/$(tagCode)).data.ownerId == request.auth.uid;
+
+        allow delete: if isVerified()
+          && isValidId(tagCode)
+          && isValidId(vaultId)
+          && existing().ownerId == request.auth.uid;
+      }
+
+      // Subcollection: /tags/{tagCode}/messages/{messageId}
+      match /messages/{messageId} {
+        allow get: if isValidId(tagCode)
+          && isValidId(messageId)
+          && exists(/databases/$(database)/documents/tags/$(tagCode));
+
+        allow list: if isVerified() && existing().ownerId == request.auth.uid;
+
+        allow create: if isValidId(tagCode)
+          && isValidId(messageId)
+          && isValidRelayMessage(incoming())
+          && incoming().tagCode == tagCode
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/tags/$(tagCode))
+          && get(/databases/$(database)/documents/tags/$(tagCode)).data.ownerId == incoming().ownerId
+          && (
+            (
+              incoming().sender == 'scanner'
+              && get(/databases/$(database)/documents/tags/$(tagCode)).data.contactEnabled == true
+              && (
+                get(/databases/$(database)/documents/tags/$(tagCode)).data.autoExpireAt == 0
+                || request.time.toMillis() < get(/databases/$(database)/documents/tags/$(tagCode)).data.autoExpireAt
+              )
+            ) ||
+            (incoming().sender == 'owner' && isVerified() && request.auth.uid == incoming().ownerId)
+          );
+
+        allow delete: if isVerified()
+          && isValidId(tagCode)
+          && isValidId(messageId)
+          && existing().ownerId == request.auth.uid;
+      }
+    }
+
+    // Collection 2: /users/{userId}/private/{configId}
+    match /users/{userId}/private/{configId} {
+      allow get: if isOwner(userId) && isValidId(userId) && isValidId(configId);
+
+      allow create: if isOwner(userId)
+        && isValidId(userId)
+        && isValidId(configId)
+        && isValidUserPrivateConfig(incoming())
+        && incoming().ownerId == userId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isOwner(userId)
+        && isValidId(userId)
+        && isValidId(configId)
+        && isValidUserPrivateConfig(incoming())
+        && existing().ownerId == userId
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'email',
+          'telegramEnabled',
+          'telegramBotToken',
+          'telegramChatId',
+          'updatedAt'
+        ]);
+
+      allow delete: if isOwner(userId) && isValidId(userId) && isValidId(configId);
+    }
+  }
+}

@@ -1,0 +1,225 @@
+{
+  "entities": {
+    "VehicleTag": {
+      "title": "VehicleTag",
+      "description": "Publicly scannable vehicle QR tag metadata containing zero personal contact details.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "Unique anonymous QR tag code (e.g., RT-482-9XK).",
+          "minLength": 4,
+          "maxLength": 20,
+          "pattern": "^[A-Z0-9\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the vehicle owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "vehicleLabel": {
+          "type": "string",
+          "description": "Vehicle make, model, or color label.",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "plateNumber": {
+          "type": "string",
+          "description": "Vehicle license plate number or masked plate identifier.",
+          "minLength": 1,
+          "maxLength": 20
+        },
+        "contactEnabled": {
+          "type": "boolean",
+          "description": "Master switch controlling whether passersby can send messages."
+        },
+        "autoExpireAt": {
+          "type": "number",
+          "description": "Epoch timestamp in ms when contact automatically shuts off, or 0 for always on."
+        },
+        "statusNote": {
+          "type": "string",
+          "description": "Short parking note displayed when contact is enabled.",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "code",
+        "ownerId",
+        "vehicleLabel",
+        "plateNumber",
+        "contactEnabled",
+        "autoExpireAt",
+        "statusNote",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserPrivateConfig": {
+      "title": "UserPrivateConfig",
+      "description": "Isolated private owner profile and Telegram Bot credentials.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "telegramEnabled": {
+          "type": "boolean"
+        },
+        "telegramBotToken": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "telegramChatId": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "email",
+        "telegramEnabled",
+        "telegramBotToken",
+        "telegramChatId",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "RelayMessage": {
+      "title": "RelayMessage",
+      "description": "Anonymous message exchanged under a vehicle tag.",
+      "type": "object",
+      "properties": {
+        "tagCode": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 20,
+          "pattern": "^[A-Z0-9\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "sender": {
+          "type": "string",
+          "enum": ["scanner", "owner"]
+        },
+        "senderAlias": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "tagCode",
+        "ownerId",
+        "sender",
+        "senderAlias",
+        "text",
+        "createdAt"
+      ]
+    },
+    "TagRelayVault": {
+      "title": "TagRelayVault",
+      "description": "AES-256-GCM server-encrypted webhook ciphertext allowing cold-started server instances to forward alerts without exposing credentials.",
+      "type": "object",
+      "properties": {
+        "tagCode": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 20,
+          "pattern": "^[A-Z0-9\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ciphertext": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 1024
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "tagCode",
+        "ownerId",
+        "ciphertext",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/tags/{tagCode}": {
+      "schema": { "$ref": "#/entities/VehicleTag" },
+      "description": "Publicly readable vehicle QR tag documents managed exclusively by their authenticated owner."
+    },
+    "/users/{userId}/private/{configId}": {
+      "schema": { "$ref": "#/entities/UserPrivateConfig" },
+      "description": "Strictly isolated owner PII and Telegram Bot credentials."
+    },
+    "/tags/{tagCode}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/RelayMessage" },
+      "description": "Anonymous relay messages belonging to a specific vehicle tag."
+    },
+    "/tags/{tagCode}/vault/{vaultId}": {
+      "schema": { "$ref": "#/entities/TagRelayVault" },
+      "description": "Server-keyed, non-listable AES-256-GCM encrypted webhook configuration for cold-start server recovery."
+    }
+  }
+}
