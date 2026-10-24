@@ -214,68 +214,83 @@ export const PublicScannerPanel: React.FC<PublicScannerPanelProps> = ({
               </div>
             )}
 
-            {/* 1-Tap Quick Alerts */}
-            <div className="space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <p className="text-xs font-semibold text-zinc-500 dark:text-zinc-400">
-                  Quick Tap Alert
-                </p>
-                {isCoolingDown && (
-                  <span
-                    data-testid="scanner-cooldown-inline"
-                    className="inline-flex items-center gap-1 text-xs font-mono font-semibold tabular-nums text-amber-700 dark:text-amber-400"
-                  >
-                    <Clock className="w-3.5 h-3.5 shrink-0" />
-                    <span>Retry in {cooldownSeconds}s</span>
-                  </span>
-                )}
-              </div>
-              <div className="grid grid-cols-1 gap-2">
-                {publicTag.quickPresets.map((preset) => (
-                  <button
-                    key={preset}
-                    type="button"
-                    disabled={sending || isCoolingDown}
-                    onClick={() => handleSend(preset)}
-                    className="spring-transition min-h-[48px] text-left px-4 py-3 rounded-2xl border border-zinc-200 dark:border-white/[0.08] bg-zinc-50/40 dark:bg-[#151922] hover:border-emerald-600 dark:hover:border-emerald-500/60 hover:bg-emerald-50/40 dark:hover:bg-emerald-950/30 text-sm font-medium text-zinc-800 dark:text-zinc-200 flex items-center justify-between gap-3 cursor-pointer active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    <span className="leading-snug">{preset}</span>
-                    {isCoolingDown ? (
-                      <span className="font-mono tabular-nums text-xs text-amber-700 dark:text-amber-400 shrink-0">
-                        {cooldownSeconds}s
-                      </span>
-                    ) : (
-                      <Send className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
-                    )}
-                  </button>
-                ))}
-              </div>
-            </div>
+            {/* Conversation thread: absent until there is something in it */}
+            {messages.length > 0 && (
+              <div className="space-y-2 max-h-72 overflow-y-auto custom-scrollbar pr-1">
+                {messages.slice(-5).map((m) => {
+                  const deliveryStatus =
+                    m.sender === 'scanner'
+                      ? computeScannerMessageDeliveryStatus(m, messages)
+                      : null;
 
-            {/* Custom Message Form */}
+                  return (
+                    <div
+                      key={m.id}
+                      className={`animate-msg-enter rounded-2xl px-4 py-3 text-xs ${
+                        m.sender === 'owner'
+                          ? 'bg-emerald-50/90 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-500/30 text-emerald-950 dark:text-emerald-100 ml-3 sm:ml-4'
+                          : 'bg-zinc-50 dark:bg-[#171B24] border border-zinc-200/80 dark:border-white/[0.07] text-zinc-800 dark:text-zinc-200 mr-3 sm:mr-4'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 text-[11px] opacity-75 mb-1">
+                        <span className="font-semibold truncate">
+                          {m.sender === 'owner' ? 'Driver' : 'You'}
+                        </span>
+                        <time
+                          data-testid="scanner-message-relative-time"
+                          dateTime={new Date(m.createdAt).toISOString()}
+                          title={new Date(m.createdAt).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
+                          className="font-mono tabular-nums shrink-0"
+                        >
+                          {formatRelativeTimestamp(m.createdAt, nowMs)}
+                        </time>
+                      </div>
+                      <p className="text-sm leading-snug break-words">{m.text}</p>
+
+                      {deliveryStatus && (
+                        <div
+                          data-testid="scanner-delivery-status"
+                          data-delivery-stage={deliveryStatus.stage}
+                          className={`mt-2 pt-1.5 border-t border-zinc-200/60 dark:border-white/[0.06] flex items-center gap-1.5 text-[11px] font-medium ${
+                            deliveryStatus.stage === 'driver-replied'
+                              ? 'text-emerald-700 dark:text-emerald-400'
+                              : deliveryStatus.stage === 'delivered-telegram'
+                              ? 'text-emerald-700/90 dark:text-emerald-400/90'
+                              : 'text-zinc-500 dark:text-zinc-400'
+                          }`}
+                        >
+                          {deliveryStatus.stage === 'driver-replied' ? (
+                            <CheckCheck className="w-3.5 h-3.5 shrink-0" />
+                          ) : (
+                            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                          )}
+                          <span>{deliveryStatus.label}</span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
             <form
               onSubmit={(e) => {
                 e.preventDefault();
                 handleSend(messageText);
               }}
-              className="space-y-2.5 pt-1"
+              className="space-y-2.5"
             >
-              <div className="flex items-center justify-between text-xs text-zinc-500 dark:text-zinc-400">
-                <label htmlFor="scanner-custom-note" className="font-semibold">
-                  Custom Note to Driver
-                </label>
-                <span className="font-mono tabular-nums text-[11px]">
-                  {messageText.length}/280
-                </span>
-              </div>
               <textarea
                 id="scanner-custom-note"
                 rows={2}
                 maxLength={280}
                 value={messageText}
                 onChange={(e) => setMessageText(e.target.value)}
-                aria-label="Custom message to vehicle owner"
-                placeholder="Or write a custom note to the driver..."
+                aria-label="Message to the driver"
+                placeholder="Write a message to the driver..."
                 className="w-full rounded-2xl border border-zinc-200 dark:border-white/[0.09] bg-zinc-50 dark:bg-[#0D1016] px-4 py-3 text-base sm:text-sm text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-500 focus:bg-white dark:focus:bg-[#131822] focus:border-zinc-900 dark:focus:border-emerald-500/60 focus:outline-none"
               />
               <button
@@ -335,81 +350,6 @@ export const PublicScannerPanel: React.FC<PublicScannerPanelProps> = ({
           </div>
         )}
 
-        {/* Anonymous Conversation Replies — Only visible when owner is reachable */}
-        {isReachable && messages.length > 0 && (
-          <div className="pt-4 border-t border-zinc-100 dark:border-white/[0.07] space-y-2.5">
-            <p className="text-xs font-semibold text-zinc-500 dark:text-zinc-400">
-              Recent Relay Replies
-            </p>
-            <div className="space-y-2 max-h-60 overflow-y-auto custom-scrollbar pr-1">
-              {messages.slice(-5).map((m) => {
-                const deliveryStatus =
-                  m.sender === 'scanner'
-                    ? computeScannerMessageDeliveryStatus(m, messages)
-                    : null;
-
-                return (
-                  <div
-                    key={m.id}
-                    className={`animate-msg-enter rounded-2xl px-4 py-3 text-xs ${
-                      m.sender === 'owner'
-                        ? 'bg-emerald-50/90 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-500/30 text-emerald-950 dark:text-emerald-100 ml-3 sm:ml-4'
-                        : 'bg-zinc-50 dark:bg-[#171B24] border border-zinc-200/80 dark:border-white/[0.07] text-zinc-800 dark:text-zinc-200 mr-3 sm:mr-4'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-2 text-[11px] opacity-75 mb-1">
-                      <span className="font-semibold truncate">
-                        {m.sender === 'owner'
-                          ? m.viaTelegram || m.senderAlias.includes('Telegram')
-                            ? 'Driver Reply · via Telegram'
-                            : 'Driver Reply'
-                          : m.senderAlias}
-                      </span>
-                      <time
-                        data-testid="scanner-message-relative-time"
-                        dateTime={new Date(m.createdAt).toISOString()}
-                        title={new Date(m.createdAt).toLocaleTimeString([], {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        })}
-                        className="font-mono tabular-nums shrink-0"
-                      >
-                        {formatRelativeTimestamp(m.createdAt, nowMs)}
-                      </time>
-                    </div>
-                    <p className="text-sm leading-snug break-words">{m.text}</p>
-
-                    {deliveryStatus && (
-                      <div
-                        data-testid="scanner-delivery-status"
-                        data-delivery-stage={deliveryStatus.stage}
-                        className={`mt-2 pt-1.5 border-t border-zinc-200/60 dark:border-white/[0.06] flex items-center gap-1.5 text-[11px] font-medium ${
-                          deliveryStatus.stage === 'driver-replied'
-                            ? 'text-emerald-700 dark:text-emerald-400'
-                            : deliveryStatus.stage === 'delivered-telegram'
-                            ? 'text-emerald-700/90 dark:text-emerald-400/90'
-                            : 'text-zinc-500 dark:text-zinc-400'
-                        }`}
-                      >
-                        {deliveryStatus.stage === 'driver-replied' ? (
-                          <CheckCheck className="w-3.5 h-3.5 shrink-0" />
-                        ) : (
-                          <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                        )}
-                        <span>{deliveryStatus.label}</span>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
-
-        <div className="pt-1 flex items-center justify-center gap-1.5 text-[11px] text-zinc-400 dark:text-zinc-400 text-center">
-          <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
-          <span>Phone numbers stay hidden · Driver can reply via Telegram or web</span>
-        </div>
       </div>
     </div>
   );

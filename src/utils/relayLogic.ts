@@ -651,34 +651,14 @@ export function isTelegramReady(tag: Pick<TagConfig, 'telegramEnabled' | 'telegr
   return Boolean(token && chat);
 }
 
+// The alert is the message itself, led by the plate when one is on file. Replies in Telegram
+// route to the most recent scanner session, so no session marker is embedded.
 export function formatTelegramRelayPayload(
-  tag: Pick<TagConfig, 'code' | 'vehicleLabel' | 'plateHint'>,
-  senderAlias: string,
-  messageText: string,
-  category?: string,
-  consoleUrl?: string,
-  sessionId?: string
+  tag: Pick<TagConfig, 'plateHint'>,
+  messageText: string
 ): string {
-  const categoryBadge = category ? `[${category.toUpperCase()}] ` : '';
-  const cleanSession = sanitizeScannerSessionId(sessionId);
-  const cleanLabel = (tag.vehicleLabel || '').trim();
-  const cleanPlate = (tag.plateHint || '').trim();
-  const vehicleHeader =
-    cleanLabel && cleanPlate
-      ? `${cleanLabel} (${cleanPlate})`
-      : cleanLabel || cleanPlate || tag.code;
-  const lines = [
-    `🚗 RelayTag Alert — ${vehicleHeader}`,
-    `Tag ID: ${tag.code}`,
-    `From: ${senderAlias}`,
-    ...(cleanSession ? [`Session: #${cleanSession}`] : []),
-    `Message: ${categoryBadge}${messageText}`,
-    `\n↩️ Reply directly to this message in Telegram to answer the scanner (or send /dnd to turn off alerts).`,
-  ];
-  if (consoleUrl) {
-    lines.push(`🌐 Web Console: ${consoleUrl}`);
-  }
-  return lines.join('\n');
+  const plate = (tag.plateHint || '').trim();
+  return plate ? `${plate}\n${messageText}` : messageText;
 }
 
 export function extractSessionIdFromTelegramText(text: unknown): string | undefined {
@@ -826,6 +806,42 @@ export function checkDndSpamShield(
     DND_SHIELD_MAX_REQUESTS,
     DND_SHIELD_WINDOW_MS
   );
+}
+
+// With the owner in Do Not Disturb, every caller together is capped per tag, so a spread of
+// IPs still cannot keep the backend busy. Answered from memory, before any I/O.
+export const DND_TAG_MAX_REQUESTS = 30;
+
+export function checkTagDndCeiling(
+  rateMap: Map<string, number[]>,
+  tagCode: string,
+  nowMs: number
+): { allowed: boolean; retryAfterSeconds: number } {
+  return checkScannerRateLimit(rateMap, `dnd-tag:${tagCode}`, nowMs, DND_TAG_MAX_REQUESTS, 60_000);
+}
+
+// Unknown tag codes each cost a Firestore lookup. Budgeted per IP across all codes, so trying a
+// new code every time does not mint a fresh allowance.
+export const LOOKUP_MAX_PER_IP = 10;
+
+export function checkLookupBudget(
+  rateMap: Map<string, number[]>,
+  ip: string,
+  nowMs: number
+): { allowed: boolean; retryAfterSeconds: number } {
+  return checkScannerRateLimit(rateMap, `lookup-ip:${ip}`, nowMs, LOOKUP_MAX_PER_IP, 60_000);
+}
+
+// Each accepted alert pings the owner's Telegram. This ceiling is per tag and keyed on nothing
+// the client supplies (session ID, alias), so it cannot be reset by rotating them.
+export const TAG_ALERTS_MAX_PER_MINUTE = 20;
+
+export function checkTagAlertCeiling(
+  rateMap: Map<string, number[]>,
+  tagCode: string,
+  nowMs: number
+): { allowed: boolean; retryAfterSeconds: number } {
+  return checkScannerRateLimit(rateMap, `alerts-tag:${tagCode}`, nowMs, TAG_ALERTS_MAX_PER_MINUTE, 60_000);
 }
 
 export function shouldPollScannerBackend(params: {

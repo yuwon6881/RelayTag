@@ -28,6 +28,9 @@ import {
   formatTelegramRelayPayload,
   parseTelegramUpdateForOwnerReply,
   checkDndSpamShield,
+  checkTagDndCeiling,
+  checkLookupBudget,
+  checkTagAlertCeiling,
   cleanupStoreState,
   createInitialTagConfig,
   hasTagSetupData,
@@ -720,29 +723,16 @@ const lastTelegramPollMap = new Map<string, number>();
 
 async function forwardToTelegramIfConfigured(
   tag: TagConfig,
-  senderAlias: string,
-  text: string,
-  category?: string,
-  sessionId?: string,
-  fallbackOrigin?: string
+  text: string
 ): Promise<{ forwarded: boolean; error?: string }> {
   if (!tag.telegramEnabled || !tag.telegramBotToken.trim() || !tag.telegramChatId.trim()) {
     return { forwarded: false };
   }
-
-  const consoleUrl =
-    (process.env.APP_URL ? process.env.APP_URL.trim() : '') ||
-    (fallbackOrigin ? fallbackOrigin.trim() : '') ||
-    undefined;
-  const payloadText = formatTelegramRelayPayload(
-    tag,
-    senderAlias,
-    text,
-    category,
-    consoleUrl,
-    sessionId
+  return sendTelegramMessageWithRetry(
+    tag.telegramBotToken,
+    tag.telegramChatId,
+    formatTelegramRelayPayload(tag, text)
   );
-  return sendTelegramMessageWithRetry(tag.telegramBotToken, tag.telegramChatId, payloadText);
 }
 
 function applyParsedTelegramUpdate(
@@ -1693,7 +1683,8 @@ async function startServer() {
         const initiallyActive = isContactWindowActive(tag.contactEnabled, tag.autoExpireAt, now);
         // Zero-Disruption DND Shield: When Reachable is OFF, block repeated QR spam in-memory before any I/O
         if (!initiallyActive) {
-          const dndCheck = checkDndSpamShield(scannerRateLimitMap, `${code}:${clientIp}`, now);
+          const ipCheck = checkDndSpamShield(scannerRateLimitMap, `${code}:${clientIp}`, now);
+          const dndCheck = ipCheck.allowed ? checkTagDndCeiling(scannerRateLimitMap, code, now) : ipCheck;
           if (!dndCheck.allowed) {
             res.setHeader('Cache-Control', 'public, max-age=30');
             res.setHeader('Retry-After', String(dndCheck.retryAfterSeconds));
@@ -1709,7 +1700,8 @@ async function startServer() {
         }
         await hydrateTagFromFirestoreIfNeeded(store, tag);
       } else {
-        const lookupCheck = checkDndSpamShield(scannerRateLimitMap, `lookup:${code}:${clientIp}`, now);
+        const codeCheck = checkDndSpamShield(scannerRateLimitMap, `lookup:${code}:${clientIp}`, now);
+        const lookupCheck = codeCheck.allowed ? checkLookupBudget(scannerRateLimitMap, clientIp, now) : codeCheck;
         if (!lookupCheck.allowed) {
           res.setHeader('Retry-After', String(lookupCheck.retryAfterSeconds));
           res.status(429).json({
@@ -1777,7 +1769,8 @@ async function startServer() {
       if (tag) {
         // Fast in-memory DND spam guard before any external Firestore/Telegram calls
         if (!isContactWindowActive(tag.contactEnabled, tag.autoExpireAt, now)) {
-          const dndCheck = checkDndSpamShield(scannerRateLimitMap, `post:${code}:${clientIp}`, now);
+          const ipCheck = checkDndSpamShield(scannerRateLimitMap, `post:${code}:${clientIp}`, now);
+          const dndCheck = ipCheck.allowed ? checkTagDndCeiling(scannerRateLimitMap, code, now) : ipCheck;
           if (!dndCheck.allowed) {
             res.setHeader('Retry-After', String(dndCheck.retryAfterSeconds));
             res.status(429).json({
@@ -1789,7 +1782,8 @@ async function startServer() {
         }
         await hydrateTagFromFirestoreIfNeeded(store, tag);
       } else {
-        const lookupCheck = checkDndSpamShield(scannerRateLimitMap, `post-lookup:${code}:${clientIp}`, now);
+        const codeCheck = checkDndSpamShield(scannerRateLimitMap, `post-lookup:${code}:${clientIp}`, now);
+        const lookupCheck = codeCheck.allowed ? checkLookupBudget(scannerRateLimitMap, clientIp, now) : codeCheck;
         if (!lookupCheck.allowed) {
           res.setHeader('Retry-After', String(lookupCheck.retryAfterSeconds));
           res.status(429).json({
@@ -1842,13 +1836,17 @@ async function startServer() {
         return;
       }
 
-      // Per-scanner/IP sliding-window rate limit (max 5 alerts per 60s)
-      const rateKey = `${tag.code}:${scannerSessionId}:${clientIp}`;
-      const rateCheck = checkScannerRateLimit(scannerRateLimitMap, rateKey, now);
-      if (!rateCheck.allowed) {
+      // Per-IP limit (max 5 alerts per 60s) keyed on nothing the client chooses: a rotating session
+      // ID or alias must not mint a fresh allowance. The per-tag ceiling covers many IPs together.
+      const rateCheck = checkScannerRateLimit(scannerRateLimitMap, `${tag.code}:${clientIp}`, now);
+      const tagCheck = rateCheck.allowed
+        ? checkTagAlertCeiling(scannerRateLimitMap, tag.code.toUpperCase(), now)
+        : rateCheck;
+      if (!tagCheck.allowed) {
+        res.setHeader('Retry-After', String(tagCheck.retryAfterSeconds));
         res.status(429).json({
-          error: `Rate limit reached. Please wait ${rateCheck.retryAfterSeconds}s before sending another alert.`,
-          retryAfterSeconds: rateCheck.retryAfterSeconds,
+          error: `Rate limit reached. Please wait ${tagCheck.retryAfterSeconds}s before sending another alert.`,
+          retryAfterSeconds: tagCheck.retryAfterSeconds,
         });
         return;
       }
@@ -1862,18 +1860,7 @@ async function startServer() {
           ? category.trim().slice(0, 24)
           : undefined;
 
-      const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
-      const host = req.get('host');
-      const fallbackOrigin = host ? `${proto}://${host}` : undefined;
-
-      const telegramResult = await forwardToTelegramIfConfigured(
-        tag,
-        cleanAlias,
-        validation.sanitizedText,
-        cleanCategory,
-        scannerSessionId,
-        fallbackOrigin
-      );
+      const telegramResult = await forwardToTelegramIfConfigured(tag, validation.sanitizedText);
 
       const newMsg: RelayMessage = {
         id: `msg-${now}-${Math.random().toString(36).slice(2, 6)}`,

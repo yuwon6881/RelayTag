@@ -25,6 +25,12 @@ import {
   extractSessionIdFromTelegramText,
   parseTelegramUpdateForOwnerReply,
   checkDndSpamShield,
+  checkTagDndCeiling,
+  checkLookupBudget,
+  checkTagAlertCeiling,
+  DND_TAG_MAX_REQUESTS,
+  LOOKUP_MAX_PER_IP,
+  TAG_ALERTS_MAX_PER_MINUTE,
   shouldPollScannerBackend,
   computeRemainingMinutes,
   cleanupStoreState,
@@ -274,16 +280,16 @@ describe('relayLogic — privacy, DND, 3h timer, rate limiting & store cleanup r
     assert.equal(validReply.sanitizedText, 'Heading down in 2 mins!');
   });
 
-  it('formats Telegram relay payload without leaking owner personal phone number', () => {
-    const text = formatTelegramRelayPayload(
-      sampleTag,
-      'Passerby #402',
-      'Blocking the exit lane',
-      'urgent'
+  it('formats the Telegram alert as just the plate and the message', () => {
+    assert.equal(
+      formatTelegramRelayPayload(sampleTag, 'Blocking the exit lane'),
+      'SBA 8492M\nBlocking the exit lane'
     );
-    assert.match(text, /RT-482-9XK/);
-    assert.match(text, /SBA 8492M/);
-    assert.match(text, /\[URGENT\] Blocking the exit lane/);
+    // No plate on file: the message alone, with no tag ID, alias, session, hint or link.
+    assert.equal(
+      formatTelegramRelayPayload({ plateHint: '' }, 'Headlights on'),
+      'Headlights on'
+    );
   });
 
   it('calculates remaining minutes accurately including 3h (180m) timer', () => {
@@ -458,20 +464,11 @@ describe('relayLogic — privacy, DND, 3h timer, rate limiting & store cleanup r
     );
   });
 
-  it('embeds scanner sessionId in Telegram payload and extracts it on swipe-to-reply', () => {
-    const payload = formatTelegramRelayPayload(
-      sampleTag,
-      'Passerby #512',
-      'Headlights left on',
-      'lights',
-      'https://relaytag.example.com',
+  it('still extracts a session marker from older alerts that carry one', () => {
+    assert.equal(
+      extractSessionIdFromTelegramText('Session: #scan-sessionA99\nMessage: Headlights left on'),
       'scan-sessionA99'
     );
-    assert.match(payload, /Session: #scan-sessionA99/);
-    assert.match(payload, /Reply directly to this message in Telegram/i);
-
-    const extracted = extractSessionIdFromTelegramText(payload);
-    assert.equal(extracted, 'scan-sessionA99');
     assert.equal(extractSessionIdFromTelegramText('No session token here'), undefined);
   });
 
@@ -518,15 +515,8 @@ describe('relayLogic — privacy, DND, 3h timer, rate limiting & store cleanup r
       assert.equal(plainReply.updateId, 501);
     }
 
-    // 2. Swipe-reply to Passerby #111's specific Telegram message routes to scan-passerby11
-    const quotedAlert = formatTelegramRelayPayload(
-      sampleTag,
-      'Passerby #111',
-      'Blocking driveway',
-      undefined,
-      undefined,
-      'scan-passerby11'
-    );
+    // 2. Swipe-reply to an older alert that carries Passerby #111's session marker routes to scan-passerby11
+    const quotedAlert = 'Session: #scan-passerby11\nMessage: Blocking driveway';
     const targetedReply = parseTelegramUpdateForOwnerReply(
       {
         update_id: 502,
@@ -630,6 +620,35 @@ describe('relayLogic — privacy, DND, 3h timer, rate limiting & store cleanup r
     const blocked = checkDndSpamShield(dndMap, '10.0.0.1', now + 500);
     assert.equal(blocked.allowed, false);
     assert.ok(blocked.retryAfterSeconds > 0);
+  });
+
+  it('caps DND traffic per tag across all callers, unknown-code lookups per IP, and alerts per tag', () => {
+    const now = 9_000_000;
+
+    // DND: many different IPs together still hit a per-tag ceiling, other tags are unaffected.
+    const dndMap = new Map<string, number[]>();
+    for (let i = 0; i < DND_TAG_MAX_REQUESTS; i++) {
+      assert.equal(checkTagDndCeiling(dndMap, 'RT-AAA-111', now + i).allowed, true);
+    }
+    const dndBlocked = checkTagDndCeiling(dndMap, 'RT-AAA-111', now + 100);
+    assert.equal(dndBlocked.allowed, false);
+    assert.ok(dndBlocked.retryAfterSeconds > 0);
+    assert.equal(checkTagDndCeiling(dndMap, 'RT-BBB-222', now + 100).allowed, true);
+
+    // Lookups: one IP cannot dodge the limit by trying a different tag code each time.
+    const lookupMap = new Map<string, number[]>();
+    for (let i = 0; i < LOOKUP_MAX_PER_IP; i++) {
+      assert.equal(checkLookupBudget(lookupMap, '198.51.100.9', now + i).allowed, true);
+    }
+    assert.equal(checkLookupBudget(lookupMap, '198.51.100.9', now + 100).allowed, false);
+    assert.equal(checkLookupBudget(lookupMap, '198.51.100.10', now + 100).allowed, true);
+
+    // Alerts: a per-tag ceiling that no client-supplied value (session ID, alias) can reset.
+    const alertMap = new Map<string, number[]>();
+    for (let i = 0; i < TAG_ALERTS_MAX_PER_MINUTE; i++) {
+      assert.equal(checkTagAlertCeiling(alertMap, 'RT-AAA-111', now + i).allowed, true);
+    }
+    assert.equal(checkTagAlertCeiling(alertMap, 'RT-AAA-111', now + 100).allowed, false);
   });
 
   it('formats relative message timestamps accurately across recurring intervals without reloading history', () => {
@@ -846,13 +865,8 @@ describe('relayLogic — privacy, DND, 3h timer, rate limiting & store cleanup r
       statusNote: '',
     });
 
-    const unconfiguredAlert = formatTelegramRelayPayload(
-      { code: 'RT-482-9XK', vehicleLabel: '', plateHint: '' },
-      'Passerby #101',
-      'Headlights on'
-    );
-    assert.match(unconfiguredAlert, /🚗 RelayTag Alert — RT-482-9XK/);
-    assert.doesNotMatch(unconfiguredAlert, /\(\)/);
+    const unconfiguredAlert = formatTelegramRelayPayload({ plateHint: '' }, 'Headlights on');
+    assert.equal(unconfiguredAlert, 'Headlights on');
   });
 
   it('enforces authorized owner email, PIN format validation, blocks header spoofing, and validates CSRF origin', async () => {
