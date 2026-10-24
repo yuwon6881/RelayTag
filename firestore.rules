@@ -28,8 +28,12 @@ service cloud.firestore {
       return isSignedIn() && request.auth.token.email_verified == true;
     }
 
+    function isAuthorizedOwner() {
+      return isVerified() && request.auth.token.email == 'yuwon6881@gmail.com';
+    }
+
     function isOwner(userId) {
-      return isVerified() && request.auth.uid == userId;
+      return isAuthorizedOwner() && request.auth.uid == userId;
     }
 
     // Validation Blueprint: VehicleTag
@@ -192,16 +196,16 @@ service cloud.firestore {
     match /tags/{tagCode} {
       allow get: if isValidId(tagCode);
 
-      allow list: if isVerified() && existing().ownerId == request.auth.uid;
+      allow list: if isAuthorizedOwner() && existing().ownerId == request.auth.uid;
 
-      allow create: if isVerified()
+      allow create: if isAuthorizedOwner()
         && isValidId(tagCode)
         && isValidVehicleTag(incoming())
         && incoming().code == tagCode
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
 
-      allow update: if isVerified()
+      allow update: if isAuthorizedOwner()
         && isValidId(tagCode)
         && isValidVehicleTag(incoming())
         && existing().ownerId == request.auth.uid
@@ -214,7 +218,7 @@ service cloud.firestore {
           incoming().diff(existing()).affectedKeys().hasOnly(['vehicleLabel', 'plateNumber', 'statusNote', 'contactEnabled', 'autoExpireAt', 'updatedAt'])
         );
 
-      allow delete: if isVerified()
+      allow delete: if isAuthorizedOwner()
         && isValidId(tagCode)
         && existing().ownerId == request.auth.uid;
 
@@ -222,13 +226,17 @@ service cloud.firestore {
       match /vault/{vaultId} {
         allow get: if isValidId(tagCode)
           && isValidId(vaultId)
+          && vaultId.size() == 36
+          && vaultId.matches('^vlt_[a-f0-9]{32}$')
           && exists(/databases/$(database)/documents/tags/$(tagCode));
 
         allow list: if false;
 
-        allow create: if isVerified()
+        allow create: if isAuthorizedOwner()
           && isValidId(tagCode)
           && isValidId(vaultId)
+          && vaultId.size() == 36
+          && vaultId.matches('^vlt_[a-f0-9]{32}$')
           && isValidTagRelayVault(incoming())
           && incoming().tagCode == tagCode
           && incoming().createdAt == request.time
@@ -236,9 +244,11 @@ service cloud.firestore {
           && exists(/databases/$(database)/documents/tags/$(tagCode))
           && get(/databases/$(database)/documents/tags/$(tagCode)).data.ownerId == request.auth.uid;
 
-        allow update: if isVerified()
+        allow update: if isAuthorizedOwner()
           && isValidId(tagCode)
           && isValidId(vaultId)
+          && vaultId.size() == 36
+          && vaultId.matches('^vlt_[a-f0-9]{32}$')
           && isValidTagRelayVault(incoming())
           && existing().ownerId == request.auth.uid
           && incoming().ownerId == existing().ownerId
@@ -249,7 +259,7 @@ service cloud.firestore {
           && exists(/databases/$(database)/documents/tags/$(tagCode))
           && get(/databases/$(database)/documents/tags/$(tagCode)).data.ownerId == request.auth.uid;
 
-        allow delete: if isVerified()
+        allow delete: if isAuthorizedOwner()
           && isValidId(tagCode)
           && isValidId(vaultId)
           && existing().ownerId == request.auth.uid;
@@ -257,11 +267,12 @@ service cloud.firestore {
 
       // Subcollection: /tags/{tagCode}/messages/{messageId}
       match /messages/{messageId} {
-        allow get: if isValidId(tagCode)
+        allow get: if isAuthorizedOwner()
+          && isValidId(tagCode)
           && isValidId(messageId)
-          && exists(/databases/$(database)/documents/tags/$(tagCode));
+          && existing().ownerId == request.auth.uid;
 
-        allow list: if isVerified() && existing().ownerId == request.auth.uid;
+        allow list: if isAuthorizedOwner() && existing().ownerId == request.auth.uid;
 
         allow create: if isValidId(tagCode)
           && isValidId(messageId)
@@ -279,10 +290,10 @@ service cloud.firestore {
                 || request.time.toMillis() < get(/databases/$(database)/documents/tags/$(tagCode)).data.autoExpireAt
               )
             ) ||
-            (incoming().sender == 'owner' && isVerified() && request.auth.uid == incoming().ownerId)
+            (incoming().sender == 'owner' && isAuthorizedOwner() && request.auth.uid == incoming().ownerId)
           );
 
-        allow delete: if isVerified()
+        allow delete: if isAuthorizedOwner()
           && isValidId(tagCode)
           && isValidId(messageId)
           && existing().ownerId == request.auth.uid;

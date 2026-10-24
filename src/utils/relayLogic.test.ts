@@ -30,11 +30,18 @@ import {
   cleanupStoreState,
   createInitialTagConfig,
   hasTagSetupData,
+  normalizePersistedTagFields,
   formatRelativeTimestamp,
   RELATIVE_TIMESTAMP_REFRESH_MS,
   extractClientIp,
   buildOwnerSessionCookie,
   computeHealthSummary,
+  generateNewTagCode,
+  computeScannerMessageDeliveryStatus,
+  extractRetryAfterSeconds,
+  formatCooldownButtonLabel,
+  sanitizeBadgeFilename,
+  buildDownloadableTagSvgBadge,
   TagConfig,
   RelayMessage,
 } from './relayLogic.ts';
@@ -701,7 +708,297 @@ describe('relayLogic — privacy, DND, 3h timer, rate limiting & store cleanup r
     assert.equal(health.activeMessageCount, 1);
     assert.equal(health.reachableTagCount, 1);
   });
+
+  it('generates distinct, schema-compliant tag codes on regeneration', () => {
+    const prev = 'RT-482-9XK';
+    for (let i = 0; i < 20; i++) {
+      const next = generateNewTagCode(prev);
+      assert.notEqual(next, prev);
+      assert.match(next, /^RT-[2-9]{3}-[A-Z2-9]{3}$/);
+      assert.match(next, /^[A-Z0-9-]+$/);
+    }
+  });
+
+  it('computes live scanner delivery status progression (Delivered to Console/Telegram -> Driver Replied)', () => {
+    const scanMsgConsole: RelayMessage = {
+      id: 'm-scan-1',
+      tagId: 'tag-1',
+      sessionId: 'scan-session-1',
+      sender: 'scanner',
+      senderAlias: 'Passerby #101',
+      text: 'Lights left on',
+      createdAt: 1000,
+      telegramForwarded: false,
+    };
+    const scanMsgTelegram: RelayMessage = {
+      ...scanMsgConsole,
+      id: 'm-scan-2',
+      createdAt: 2000,
+      telegramForwarded: true,
+    };
+
+    // Before driver replies
+    const threadBeforeReply = filterMessagesForPublicScanner(
+      [scanMsgConsole, scanMsgTelegram],
+      'tag-1',
+      true,
+      'scan-session-1'
+    );
+    assert.equal(threadBeforeReply[1].telegramForwarded, true);
+
+    assert.deepEqual(
+      computeScannerMessageDeliveryStatus(threadBeforeReply[0], threadBeforeReply),
+      { stage: 'delivered-relay', label: 'Delivered to Console' }
+    );
+    assert.deepEqual(
+      computeScannerMessageDeliveryStatus(threadBeforeReply[1], threadBeforeReply),
+      { stage: 'delivered-telegram', label: 'Delivered to Telegram' }
+    );
+
+    // After driver replies
+    const ownerReply: RelayMessage = {
+      id: 'm-owner-1',
+      tagId: 'tag-1',
+      sessionId: 'scan-session-1',
+      sender: 'owner',
+      senderAlias: 'Vehicle Owner',
+      text: 'Coming down in 2 mins!',
+      createdAt: 3000,
+    };
+    const threadAfterReply = [...threadBeforeReply, ownerReply];
+    assert.deepEqual(
+      computeScannerMessageDeliveryStatus(threadBeforeReply[1], threadAfterReply),
+      { stage: 'driver-replied', label: 'Driver Replied' }
+    );
+  });
+
+  it('extracts rate-limit retryAfterSeconds and formats live cooldown button labels', () => {
+    assert.equal(extractRetryAfterSeconds({ retryAfterSeconds: 14 }), 14);
+    assert.equal(extractRetryAfterSeconds({ retryAfterSeconds: 11.2 }), 12);
+    assert.equal(
+      extractRetryAfterSeconds({
+        error: 'Rate limit reached. Please wait 19s before sending another alert.',
+      }),
+      19
+    );
+    assert.equal(extractRetryAfterSeconds({ error: 'Network error' }), 0);
+    assert.equal(extractRetryAfterSeconds(null), 0);
+
+    assert.equal(formatCooldownButtonLabel(14), 'Retry in 14s');
+    assert.equal(formatCooldownButtonLabel(0, 'Send Anonymous Message'), 'Send Anonymous Message');
+  });
+
+  it('builds downloadable SVG badges and sanitized PNG/SVG filenames', () => {
+    assert.equal(sanitizeBadgeFilename('RT-482-9XK', 'png'), 'relaytag-RT-482-9XK.png');
+    assert.equal(sanitizeBadgeFilename('rt-999-abc', 'svg'), 'relaytag-RT-999-ABC.svg');
+
+    const svgBadge = buildDownloadableTagSvgBadge({
+      code: 'RT-482-9XK',
+      plateHint: 'SBA 8492M',
+      vehicleLabel: 'Slate Civic & Co',
+      qrSvgMarkup: '<svg viewBox="0 0 33 33"><path d="M0 0h10v10H0z" fill="#141413"/></svg>',
+    });
+    assert.match(svgBadge, /WINDSHIELD TAG · RT-482-9XK/);
+    assert.match(svgBadge, /SBA 8492M · Slate Civic &amp; Co/);
+    assert.match(
+      svgBadge,
+      /<svg x="144" y="224" width="352" height="352" viewBox="0 0 33 33" shape-rendering="crispEdges">/
+    );
+  });
+
+  it('normalizes legacy placeholder strings from persisted Firestore records and formats empty-field Telegram headers cleanly', () => {
+    const legacyNormalized = normalizePersistedTagFields({
+      code: 'RT-482-9XK',
+      vehicleLabel: 'Registered Vehicle',
+      plateNumber: 'RT-482-9XK',
+      statusNote: 'Contact via RelayTag',
+    });
+    assert.deepEqual(legacyNormalized, {
+      vehicleLabel: '',
+      plateHint: '',
+      statusNote: '',
+    });
+
+    assert.equal(
+      hasTagSetupData({
+        code: 'RT-482-9XK',
+        vehicleLabel: 'Registered Vehicle',
+        plateNumber: 'RT-482-9XK',
+        statusNote: 'Contact via RelayTag',
+      }),
+      false
+    );
+
+    const realNormalized = normalizePersistedTagFields({
+      code: 'RT-482-9XK',
+      vehicleLabel: 'Slate Civic Hatchback',
+      plateNumber: 'sba 8492m',
+      statusNote: '',
+    });
+    assert.deepEqual(realNormalized, {
+      vehicleLabel: 'Slate Civic Hatchback',
+      plateHint: 'SBA 8492M',
+      statusNote: '',
+    });
+
+    const unconfiguredAlert = formatTelegramRelayPayload(
+      { code: 'RT-482-9XK', vehicleLabel: '', plateHint: '' },
+      'Passerby #101',
+      'Headlights on'
+    );
+    assert.match(unconfiguredAlert, /🚗 RelayTag Alert — RT-482-9XK/);
+    assert.doesNotMatch(unconfiguredAlert, /\(\)/);
+  });
+
+  it('enforces authorized owner email, PIN format validation, blocks header spoofing, and validates CSRF origin', async () => {
+    const {
+      AUTHORIZED_OWNER_EMAIL,
+      isAuthorizedOwnerEmail,
+      validateOwnerPinFormat,
+      evaluateOwnerSessionRequest,
+      verifySameOriginRequest,
+    } = await import('./relayLogic.ts');
+
+    // Authorized owner email check
+    assert.equal(isAuthorizedOwnerEmail(AUTHORIZED_OWNER_EMAIL), true);
+    assert.equal(isAuthorizedOwnerEmail('YUWON6881@GMAIL.COM '), true);
+    assert.equal(isAuthorizedOwnerEmail('stranger@example.com'), false);
+    assert.equal(isAuthorizedOwnerEmail(null), false);
+
+    // Owner PIN format validation (4-8 digits)
+    assert.equal(validateOwnerPinFormat('4829').valid, true);
+    assert.equal(validateOwnerPinFormat(' 12345678 ').cleanPin, '12345678');
+    assert.equal(validateOwnerPinFormat('123').valid, false);
+    assert.equal(validateOwnerPinFormat('123456789').valid, false);
+    assert.equal(validateOwnerPinFormat('12a4').valid, false);
+
+    const validTokens = new Set(['tok-existing-1']);
+
+    // Unauthenticated visitor without token, Google auth, or PIN is rejected with 401
+    const unauthEval = evaluateOwnerSessionRequest({
+      existingToken: null,
+      validTokens,
+      firebaseUid: null,
+      firebaseEmail: null,
+      tagOwnerUid: 'owner-uid-1',
+      allowedOwnerEmail: AUTHORIZED_OWNER_EMAIL,
+      pinVerified: false,
+      pinAttemptProvided: false,
+    });
+    assert.equal(unauthEval.allowed, false);
+    assert.equal(unauthEval.status, 401);
+
+    // Header spoofing attempt (raw X-Firebase-Uid / X-Firebase-Email without verified Bearer token) is rejected with 401
+    const spoofedHeaderEval = evaluateOwnerSessionRequest({
+      existingToken: null,
+      validTokens,
+      firebaseUid: null,
+      firebaseEmail: null,
+      firebaseTokenVerified: false,
+      firebaseEmailVerified: false,
+      unverifiedHeaderPresent: true,
+      tagOwnerUid: 'owner-uid-1',
+      allowedOwnerEmail: AUTHORIZED_OWNER_EMAIL,
+      pinVerified: false,
+      pinAttemptProvided: false,
+    });
+    assert.equal(spoofedHeaderEval.allowed, false);
+    assert.equal(spoofedHeaderEval.status, 401);
+
+    // Unverified Bearer token (firebaseTokenVerified: false) is rejected with 401 even if UID & email match
+    const unverifiedTokenEval = evaluateOwnerSessionRequest({
+      existingToken: null,
+      validTokens,
+      firebaseUid: 'owner-uid-1',
+      firebaseEmail: AUTHORIZED_OWNER_EMAIL,
+      firebaseTokenVerified: false,
+      firebaseEmailVerified: true,
+      tagOwnerUid: 'owner-uid-1',
+      allowedOwnerEmail: AUTHORIZED_OWNER_EMAIL,
+      pinVerified: false,
+      pinAttemptProvided: false,
+    });
+    assert.equal(unverifiedTokenEval.allowed, false);
+    assert.equal(unverifiedTokenEval.status, 401);
+
+    // Unverified Google email (firebaseEmailVerified: false) is rejected with 403
+    const unverifiedEmailEval = evaluateOwnerSessionRequest({
+      existingToken: null,
+      validTokens,
+      firebaseUid: 'owner-uid-1',
+      firebaseEmail: AUTHORIZED_OWNER_EMAIL,
+      firebaseTokenVerified: true,
+      firebaseEmailVerified: false,
+      tagOwnerUid: 'owner-uid-1',
+      allowedOwnerEmail: AUTHORIZED_OWNER_EMAIL,
+      pinVerified: false,
+      pinAttemptProvided: false,
+    });
+    assert.equal(unverifiedEmailEval.allowed, false);
+    assert.equal(unverifiedEmailEval.status, 403);
+
+    // Unauthorized Google account is rejected with 403
+    const wrongAccountEval = evaluateOwnerSessionRequest({
+      existingToken: null,
+      validTokens,
+      firebaseUid: 'intruder-uid',
+      firebaseEmail: 'intruder@gmail.com',
+      firebaseTokenVerified: true,
+      firebaseEmailVerified: true,
+      tagOwnerUid: 'owner-uid-1',
+      allowedOwnerEmail: AUTHORIZED_OWNER_EMAIL,
+      pinVerified: false,
+      pinAttemptProvided: false,
+    });
+    assert.equal(wrongAccountEval.allowed, false);
+    assert.equal(wrongAccountEval.status, 403);
+
+    // Cryptographically verified authorized owner Google account is granted session
+    const validGoogleEval = evaluateOwnerSessionRequest({
+      existingToken: null,
+      validTokens,
+      firebaseUid: 'owner-uid-1',
+      firebaseEmail: AUTHORIZED_OWNER_EMAIL,
+      firebaseTokenVerified: true,
+      firebaseEmailVerified: true,
+      tagOwnerUid: 'owner-uid-1',
+      allowedOwnerEmail: AUTHORIZED_OWNER_EMAIL,
+      pinVerified: false,
+      pinAttemptProvided: false,
+    });
+    assert.equal(validGoogleEval.allowed, true);
+    assert.equal(validGoogleEval.authMethod, 'google');
+
+    // Valid PIN unlock is granted session
+    const validPinEval = evaluateOwnerSessionRequest({
+      existingToken: null,
+      validTokens,
+      firebaseUid: null,
+      firebaseEmail: null,
+      tagOwnerUid: 'owner-uid-1',
+      allowedOwnerEmail: AUTHORIZED_OWNER_EMAIL,
+      pinVerified: true,
+      pinAttemptProvided: true,
+    });
+    assert.equal(validPinEval.allowed, true);
+    assert.equal(validPinEval.authMethod, 'pin');
+
+    // CSRF Same-Origin check
+    assert.equal(verifySameOriginRequest('https://relaytag.app', 'relaytag.app'), true);
+    assert.equal(verifySameOriginRequest('https://evil.example.com', 'relaytag.app'), false);
+    assert.equal(verifySameOriginRequest(undefined, 'relaytag.app'), true);
+
+    // Strip ownerPinHash in toOwnerTagView while exposing ownerPinConfigured boolean
+    const viewWithPin = toOwnerTagView({
+      ...sampleTag,
+      ownerPinHash: 'salt:deadbeef',
+    });
+    assert.equal(viewWithPin.ownerPinConfigured, true);
+    assert.equal('ownerPinHash' in viewWithPin, false);
+  });
 });
+
+
 
 
 

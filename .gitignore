@@ -1,12 +1,35 @@
+# Dependencies & build output
 node_modules/
 build/
 dist/
 coverage/
+
+# Environment variables & secrets (never commit real credentials)
+.env
+.env.*
+!.env.example
+
+# Firebase & Google Cloud local configuration / credentials
+firebase-applet-config.json
+firebase_applet_config.xml
+.firebase/
+firebase-debug.log*
+firestore-debug.log*
+ui-debug.log*
+*service-account*.json
+*credentials*.json
+*.pem
+*.key
+*.p12
+DRAFT_firestore.rules
+
+# Runtime relay stores & backups (contain tokens / local state)
+.relay-data.json
+.relaytag-store*
+relaytag-store*.json*
+
+# AI Studio & test artifacts
+.aistudio/
+.playwright-cli/
 .DS_Store
 *.log
-.env*
-!.env.example
-.relay-data.json
-.relaytag-store-backup.json*
-.playwright-cli/
-

@@ -1,5 +1,6 @@
 export type SenderRole = 'scanner' | 'owner';
 
+export const AUTHORIZED_OWNER_EMAIL = 'yuwon6881@gmail.com';
 export const MASKED_BOT_TOKEN = '••••••••••••';
 export const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute sliding window
 export const RATE_LIMIT_MAX_MESSAGES = 5; // max 5 messages per minute per scanner key
@@ -21,6 +22,8 @@ export interface TagConfig {
   id: string;
   code: string;
   ownerUid?: string | null;
+  ownerEmail?: string | null;
+  ownerPinHash?: string | null;
   vehicleLabel: string;
   plateHint: string;
   contactEnabled: boolean;
@@ -34,8 +37,9 @@ export interface TagConfig {
   updatedAt: number;
 }
 
-export interface OwnerTagView extends TagConfig {
+export interface OwnerTagView extends Omit<TagConfig, 'ownerPinHash'> {
   telegramBotTokenConfigured: boolean;
+  ownerPinConfigured: boolean;
 }
 
 export interface PublicTagView {
@@ -69,7 +73,34 @@ export const DEFAULT_QUICK_PRESETS = [
   'Window or trunk appears slightly open',
 ];
 
+export function normalizePersistedTagFields(raw: {
+  code?: string | null;
+  vehicleLabel?: string | null;
+  plateNumber?: string | null;
+  plateHint?: string | null;
+  statusNote?: string | null;
+}): {
+  vehicleLabel: string;
+  plateHint: string;
+  statusNote: string;
+} {
+  const cleanCode = (raw.code || '').trim().toUpperCase();
+  const rawVehicle = (raw.vehicleLabel || '').trim();
+  const rawPlate = (raw.plateNumber ?? raw.plateHint ?? '').trim().toUpperCase();
+  const rawNote = (raw.statusNote || '').trim();
+
+  const vehicleLabel =
+    rawVehicle === 'Registered Vehicle' ? '' : rawVehicle.slice(0, 60);
+  const plateHint =
+    cleanCode && rawPlate === cleanCode ? '' : rawPlate.slice(0, 20);
+  const statusNote =
+    rawNote === 'Contact via RelayTag' ? '' : rawNote.slice(0, 160);
+
+  return { vehicleLabel, plateHint, statusNote };
+}
+
 export function hasTagSetupData(tag: {
+  code?: string | null;
   vehicleLabel?: string | null;
   plateHint?: string | null;
   plateNumber?: string | null;
@@ -78,11 +109,11 @@ export function hasTagSetupData(tag: {
   telegramBotToken?: string | null;
   telegramChatId?: string | null;
 }): boolean {
+  const normalized = normalizePersistedTagFields(tag);
   return Boolean(
-    (tag.vehicleLabel && tag.vehicleLabel.trim()) ||
-      (tag.plateHint && tag.plateHint.trim()) ||
-      (tag.plateNumber && tag.plateNumber.trim()) ||
-      (tag.statusNote && tag.statusNote.trim()) ||
+    normalized.vehicleLabel ||
+      normalized.plateHint ||
+      normalized.statusNote ||
       tag.telegramEnabled ||
       (tag.telegramBotToken && tag.telegramBotToken.trim()) ||
       (tag.telegramChatId && tag.telegramChatId.trim())
@@ -94,6 +125,8 @@ export function createInitialTagConfig(nowMs: number = Date.now()): TagConfig {
     id: 'tag-default',
     code: 'RT-482-9XK',
     ownerUid: null,
+    ownerEmail: AUTHORIZED_OWNER_EMAIL,
+    ownerPinHash: null,
     vehicleLabel: '',
     plateHint: '',
     contactEnabled: false,
@@ -121,10 +154,13 @@ export function isContactWindowActive(
 
 export function toOwnerTagView(tag: TagConfig): OwnerTagView {
   const configured = Boolean(tag.telegramBotToken && tag.telegramBotToken.trim());
+  const pinConfigured = Boolean(tag.ownerPinHash && tag.ownerPinHash.trim());
+  const { ownerPinHash: _omittedPinHash, ...safeTag } = tag;
   return {
-    ...tag,
+    ...safeTag,
     telegramBotToken: configured ? MASKED_BOT_TOKEN : '',
     telegramBotTokenConfigured: configured,
+    ownerPinConfigured: pinConfigured,
   };
 }
 
@@ -185,6 +221,7 @@ export function filterMessagesForPublicScanner(
       text: m.text,
       category: m.category,
       createdAt: m.createdAt,
+      telegramForwarded: m.telegramForwarded,
       viaTelegram: m.viaTelegram,
     }));
 }
@@ -270,12 +307,160 @@ export function resolveTargetScannerSession(
   return undefined;
 }
 
+export function isAuthorizedOwnerEmail(
+  email: unknown,
+  allowedOwnerEmail: string = AUTHORIZED_OWNER_EMAIL
+): boolean {
+  if (typeof email !== 'string') return false;
+  const cleanEmail = email.trim().toLowerCase();
+  const cleanAllowed = (allowedOwnerEmail || AUTHORIZED_OWNER_EMAIL).trim().toLowerCase();
+  if (!cleanEmail || !cleanAllowed) return false;
+  return cleanEmail === cleanAllowed;
+}
+
+export function validateOwnerPinFormat(rawPin: unknown): {
+  valid: boolean;
+  cleanPin: string;
+  error?: string;
+} {
+  if (typeof rawPin !== 'string') {
+    return {
+      valid: false,
+      cleanPin: '',
+      error: 'Security PIN must be a 4 to 8 digit number.',
+    };
+  }
+  const cleanPin = rawPin.trim();
+  if (!/^\d{4,8}$/.test(cleanPin)) {
+    return {
+      valid: false,
+      cleanPin: '',
+      error: 'Security PIN must be 4 to 8 digits (numbers 0–9 only).',
+    };
+  }
+  return { valid: true, cleanPin };
+}
+
+export interface OwnerSessionEvalInput {
+  existingToken?: string | null;
+  validTokens: Set<string>;
+  firebaseUid?: string | null;
+  firebaseEmail?: string | null;
+  firebaseTokenVerified?: boolean;
+  firebaseEmailVerified?: boolean;
+  unverifiedHeaderPresent?: boolean;
+  tagOwnerUid?: string | null;
+  allowedOwnerEmail?: string | null;
+  pinVerified?: boolean;
+  pinAttemptProvided?: boolean;
+}
+
+export interface OwnerSessionEvalResult {
+  allowed: boolean;
+  status: 200 | 401 | 403;
+  error?: string;
+  authMethod?: 'google' | 'pin' | 'existing-token';
+}
+
+export function evaluateOwnerSessionRequest(
+  input: OwnerSessionEvalInput
+): OwnerSessionEvalResult {
+  const allowedEmail = (input.allowedOwnerEmail || AUTHORIZED_OWNER_EMAIL).trim().toLowerCase();
+  const cleanUid = typeof input.firebaseUid === 'string' ? input.firebaseUid.trim() : '';
+  const cleanEmail =
+    typeof input.firebaseEmail === 'string' ? input.firebaseEmail.trim().toLowerCase() : '';
+  const cleanTagOwnerUid =
+    typeof input.tagOwnerUid === 'string' ? input.tagOwnerUid.trim() : '';
+
+  // 1. If a PIN unlock attempt was explicitly submitted, verify it strictly
+  if (input.pinAttemptProvided) {
+    if (!input.pinVerified) {
+      return {
+        allowed: false,
+        status: 403,
+        error: 'Invalid Owner Security PIN. Please check your passcode and try again.',
+      };
+    }
+    return { allowed: true, status: 200, authMethod: 'pin' };
+  }
+
+  // 2. If a Google/Firebase email is provided, it MUST match the authorized owner email
+  if (cleanEmail && !isAuthorizedOwnerEmail(cleanEmail, allowedEmail)) {
+    return {
+      allowed: false,
+      status: 403,
+      error: `Forbidden: Account (${cleanEmail}) is not authorized to access this RelayTag console.`,
+    };
+  }
+
+  // 3. If tag is already claimed by a specific Firebase UID and caller provides a different UID, deny
+  if (cleanTagOwnerUid && cleanUid && cleanTagOwnerUid !== cleanUid) {
+    return {
+      allowed: false,
+      status: 403,
+      error: 'Forbidden: This vehicle tag is registered to a different owner account.',
+    };
+  }
+
+  // 4. Authorized Google sign-in: MUST come from a cryptographically verified Firebase ID token with email_verified == true
+  if (cleanUid) {
+    if (input.firebaseTokenVerified === false) {
+      return {
+        allowed: false,
+        status: 401,
+        error:
+          'Unauthorized: Cryptographically verified Firebase Bearer ID token is required for Google sign-in.',
+      };
+    }
+    if (input.firebaseEmailVerified === false) {
+      return {
+        allowed: false,
+        status: 403,
+        error: 'Forbidden: Google account email address must be verified.',
+      };
+    }
+    if (isAuthorizedOwnerEmail(cleanEmail, allowedEmail)) {
+      return { allowed: true, status: 200, authMethod: 'google' };
+    }
+    return {
+      allowed: false,
+      status: 403,
+      error: 'Forbidden: Verified owner email is required to unlock this console.',
+    };
+  }
+
+  // 5. Existing valid owner token from an already-authenticated session
+  const existingTok = typeof input.existingToken === 'string' ? input.existingToken.trim() : '';
+  if (existingTok && input.validTokens.has(existingTok)) {
+    return { allowed: true, status: 200, authMethod: 'existing-token' };
+  }
+
+  // 6. Block raw X-Firebase-Uid / X-Firebase-Email header spoofing attempts when no verified Bearer token is present
+  if (input.unverifiedHeaderPresent) {
+    return {
+      allowed: false,
+      status: 401,
+      error:
+        'Unauthorized: Unverified identity headers rejected. Provide a valid Authorization Bearer ID token or Owner Security PIN.',
+    };
+  }
+
+  // 7. Default Deny: Unauthenticated visitor cannot establish an owner session
+  return {
+    allowed: false,
+    status: 401,
+    error:
+      'Unauthorized: Owner authentication required. Sign in with the authorized Google account or enter your Owner Security PIN.',
+  };
+}
 
 export function verifyOwnerAccess(params: {
   providedToken?: string | null;
   validTokens: Set<string>;
   tagOwnerUid?: string | null;
   providedFirebaseUid?: string | null;
+  providedOwnerEmail?: string | null;
+  allowedOwnerEmail?: string | null;
 }): { authorized: boolean; status: 200 | 401 | 403; error?: string } {
   const token = (params.providedToken || '').trim();
   if (!token || !params.validTokens.has(token)) {
@@ -283,6 +468,22 @@ export function verifyOwnerAccess(params: {
       authorized: false,
       status: 401,
       error: 'Unauthorized: Valid owner session token required.',
+    };
+  }
+
+  if (
+    typeof params.providedOwnerEmail === 'string' &&
+    params.providedOwnerEmail.trim() &&
+    !isAuthorizedOwnerEmail(
+      params.providedOwnerEmail,
+      params.allowedOwnerEmail || AUTHORIZED_OWNER_EMAIL
+    )
+  ) {
+    return {
+      authorized: false,
+      status: 403,
+      error:
+        'Forbidden: This Google account is not authorized to access the RelayTag owner console.',
     };
   }
 
@@ -299,6 +500,24 @@ export function verifyOwnerAccess(params: {
   }
 
   return { authorized: true, status: 200 };
+}
+
+export function verifySameOriginRequest(
+  originHeader: unknown,
+  hostHeader: unknown
+): boolean {
+  if (typeof originHeader !== 'string' || !originHeader.trim()) {
+    return true; // Non-CORS same-origin requests without Origin header are guarded by custom header requirement
+  }
+  if (typeof hostHeader !== 'string' || !hostHeader.trim()) {
+    return false;
+  }
+  try {
+    const parsedOrigin = new URL(originHeader.trim());
+    return parsedOrigin.host.toLowerCase() === hostHeader.trim().toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 function sanitizeMessageText(rawText: unknown): string {
@@ -442,8 +661,14 @@ export function formatTelegramRelayPayload(
 ): string {
   const categoryBadge = category ? `[${category.toUpperCase()}] ` : '';
   const cleanSession = sanitizeScannerSessionId(sessionId);
+  const cleanLabel = (tag.vehicleLabel || '').trim();
+  const cleanPlate = (tag.plateHint || '').trim();
+  const vehicleHeader =
+    cleanLabel && cleanPlate
+      ? `${cleanLabel} (${cleanPlate})`
+      : cleanLabel || cleanPlate || tag.code;
   const lines = [
-    `🚗 RelayTag Alert — ${tag.vehicleLabel} (${tag.plateHint})`,
+    `🚗 RelayTag Alert — ${vehicleHeader}`,
     `Tag ID: ${tag.code}`,
     `From: ${senderAlias}`,
     ...(cleanSession ? [`Session: #${cleanSession}`] : []),
@@ -893,5 +1118,159 @@ export function computeHealthSummary(
     reachableTagCount,
   };
 }
+
+const TAG_DIGITS = '23456789';
+const TAG_ALPHANUM = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+
+export function generateNewTagCode(existingCode?: string): string {
+  const cleanExisting = (existingCode || '').trim().toUpperCase();
+  for (let attempt = 0; attempt < 25; attempt++) {
+    let digits = '';
+    for (let i = 0; i < 3; i++) {
+      digits += TAG_DIGITS[Math.floor(Math.random() * TAG_DIGITS.length)];
+    }
+    let suffix = '';
+    for (let i = 0; i < 3; i++) {
+      suffix += TAG_ALPHANUM[Math.floor(Math.random() * TAG_ALPHANUM.length)];
+    }
+    const candidate = `RT-${digits}-${suffix}`;
+    if (candidate !== cleanExisting) {
+      return candidate;
+    }
+  }
+  return `RT-984-7XK`;
+}
+
+export type ScannerDeliveryStage =
+  | 'driver-replied'
+  | 'delivered-telegram'
+  | 'delivered-relay';
+
+export interface ScannerDeliveryStatusInfo {
+  stage: ScannerDeliveryStage;
+  label: string;
+}
+
+export function computeScannerMessageDeliveryStatus(
+  msg: RelayMessage,
+  threadMessages: RelayMessage[]
+): ScannerDeliveryStatusInfo {
+  const hasDriverReply = threadMessages.some(
+    (other) => other.sender === 'owner' && other.createdAt >= msg.createdAt
+  );
+
+  if (hasDriverReply) {
+    return {
+      stage: 'driver-replied',
+      label: 'Driver Replied',
+    };
+  }
+
+  if (msg.telegramForwarded) {
+    return {
+      stage: 'delivered-telegram',
+      label: 'Delivered to Telegram',
+    };
+  }
+
+  return {
+    stage: 'delivered-relay',
+    label: 'Delivered to Console',
+  };
+}
+
+export function extractRetryAfterSeconds(
+  payload: { retryAfterSeconds?: unknown; error?: unknown } | null | undefined
+): number {
+  if (!payload) return 0;
+  if (
+    typeof payload.retryAfterSeconds === 'number' &&
+    Number.isFinite(payload.retryAfterSeconds) &&
+    payload.retryAfterSeconds > 0
+  ) {
+    return Math.ceil(payload.retryAfterSeconds);
+  }
+  if (typeof payload.error === 'string') {
+    const match = payload.error.match(/(?:wait|in)\s+(\d+)\s*s/i);
+    if (match && match[1]) {
+      const parsed = Number.parseInt(match[1], 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+  }
+  return 0;
+}
+
+export function formatCooldownButtonLabel(
+  cooldownSeconds: number,
+  defaultLabel = 'Send Anonymous Message'
+): string {
+  if (Number.isFinite(cooldownSeconds) && cooldownSeconds > 0) {
+    return `Retry in ${Math.ceil(cooldownSeconds)}s`;
+  }
+  return defaultLabel;
+}
+
+export function sanitizeBadgeFilename(
+  code: string,
+  format: 'png' | 'svg'
+): string {
+  const cleanCode = (code || 'TAG')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9-]/g, '')
+    .slice(0, 20) || 'TAG';
+  return `relaytag-${cleanCode}.${format}`;
+}
+
+function escapeXmlText(input: string): string {
+  return input
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+export function buildDownloadableTagSvgBadge(params: {
+  code: string;
+  plateHint?: string;
+  vehicleLabel?: string;
+  qrSvgMarkup: string;
+}): string {
+  const cleanCode = escapeXmlText((params.code || 'RT-482-9XK').trim().toUpperCase());
+  const cleanPlate = escapeXmlText((params.plateHint || '').trim().toUpperCase());
+  const cleanVehicle = escapeXmlText((params.vehicleLabel || '').trim());
+  const vehicleSubtitle =
+    cleanPlate && cleanVehicle
+      ? `${cleanPlate} · ${cleanVehicle}`
+      : cleanPlate || cleanVehicle || 'Registered Vehicle';
+
+  // Extract inner elements and viewBox from generated QR SVG so it nests cleanly at (140, 230) 360x360
+  const rawQr = params.qrSvgMarkup || '';
+  const viewBoxMatch = rawQr.match(/viewBox="([^"]+)"/i);
+  const qrViewBox = viewBoxMatch ? viewBoxMatch[1] : '0 0 33 33';
+  const innerQr = rawQr
+    .replace(/^[\s\S]*?<svg[^>]*>/i, '')
+    .replace(/<\/svg>\s*$/i, '');
+
+  return [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="780" viewBox="0 0 640 780" fill="none">`,
+    `  <rect width="640" height="780" rx="44" fill="#F4F5F7"/>`,
+    `  <rect x="24" y="24" width="592" height="732" rx="32" fill="#FFFFFF" stroke="#E4E4E7" stroke-width="2"/>`,
+    `  <text x="320" y="88" text-anchor="middle" fill="#047857" font-family="'JetBrains Mono', monospace" font-size="16" font-weight="700" letter-spacing="0.06em">WINDSHIELD TAG · ${cleanCode}</text>`,
+    `  <text x="320" y="132" text-anchor="middle" fill="#111318" font-family="'Plus Jakarta Sans', -apple-system, sans-serif" font-size="32" font-weight="800">Scan to Contact Driver</text>`,
+    `  <text x="320" y="168" text-anchor="middle" fill="#52525B" font-family="'JetBrains Mono', monospace" font-size="18" font-weight="600">${vehicleSubtitle}</text>`,
+    `  <rect x="120" y="200" width="400" height="400" rx="28" fill="#FFFFFF" stroke="#E4E4E7" stroke-width="2"/>`,
+    `  <svg x="144" y="224" width="352" height="352" viewBox="${qrViewBox}" shape-rendering="crispEdges">`,
+    `    ${innerQr}`,
+    `  </svg>`,
+    `  <text x="320" y="654" text-anchor="middle" fill="#3F3F46" font-family="'Plus Jakarta Sans', -apple-system, sans-serif" font-size="17" font-weight="600">Anonymous 2-Way Windshield Relay</text>`,
+    `  <text x="320" y="684" text-anchor="middle" fill="#71717A" font-family="'Plus Jakarta Sans', -apple-system, sans-serif" font-size="14" font-weight="500">Phone numbers stay hidden · Driver reachable when Contact is ON</text>`,
+    `</svg>`,
+  ].join('\n');
+}
+
 
 

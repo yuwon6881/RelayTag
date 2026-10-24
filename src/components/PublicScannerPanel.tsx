@@ -1,10 +1,22 @@
 import React, { useState, useEffect } from 'react';
-import { ShieldCheck, Lock, Send, CheckCircle2, AlertCircle, Car } from 'lucide-react';
+import {
+  ShieldCheck,
+  Lock,
+  Send,
+  CheckCircle2,
+  CheckCheck,
+  AlertCircle,
+  Car,
+  Clock,
+} from 'lucide-react';
 import {
   PublicTagView,
   RelayMessage,
   formatRelativeTimestamp,
   RELATIVE_TIMESTAMP_REFRESH_MS,
+  computeScannerMessageDeliveryStatus,
+  extractRetryAfterSeconds,
+  formatCooldownButtonLabel,
 } from '../utils/relayLogic';
 
 interface PublicScannerPanelProps {
@@ -15,7 +27,12 @@ interface PublicScannerPanelProps {
     text: string;
     category?: string;
     senderAlias?: string;
-  }) => Promise<{ ok: boolean; error?: string; telegramForwarded?: boolean }>;
+  }) => Promise<{
+    ok: boolean;
+    error?: string;
+    telegramForwarded?: boolean;
+    retryAfterSeconds?: number;
+  }>;
 }
 
 export const PublicScannerPanel: React.FC<PublicScannerPanelProps> = ({
@@ -26,9 +43,11 @@ export const PublicScannerPanel: React.FC<PublicScannerPanelProps> = ({
 }) => {
   const [messageText, setMessageText] = useState('');
   const [sending, setSending] = useState(false);
+  const [cooldownSeconds, setCooldownSeconds] = useState(0);
   const [feedback, setFeedback] = useState<{
     type: 'success' | 'error';
     text: string;
+    isRateLimit?: boolean;
   } | null>(null);
 
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
@@ -40,6 +59,24 @@ export const PublicScannerPanel: React.FC<PublicScannerPanelProps> = ({
       setNowMs(Date.now());
     }
   }, [messages]);
+
+  // Live 1-second countdown timer when rate-limit cooldown is active
+  useEffect(() => {
+    if (cooldownSeconds <= 0) {
+      return;
+    }
+    const timerId = window.setInterval(() => {
+      setCooldownSeconds((prev) => {
+        if (prev <= 1) {
+          setFeedback((curr) => (curr?.isRateLimit ? null : curr));
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => window.clearInterval(timerId);
+  }, [cooldownSeconds]);
 
   // Recurring interval effect to keep relative message timestamps updated without reloading history
   useEffect(() => {
@@ -88,7 +125,7 @@ export const PublicScannerPanel: React.FC<PublicScannerPanelProps> = ({
   }
 
   const handleSend = async (textToUse: string) => {
-    if (sending) return;
+    if (sending || cooldownSeconds > 0) return;
     setSending(true);
     setFeedback(null);
     const result = await onSendMessage({ text: textToUse });
@@ -103,12 +140,28 @@ export const PublicScannerPanel: React.FC<PublicScannerPanelProps> = ({
           : 'Message delivered to vehicle owner.',
       });
     } else {
-      setFeedback({
-        type: 'error',
-        text: result.error || 'Could not send message.',
-      });
+      const retrySecs = extractRetryAfterSeconds(result);
+      if (retrySecs > 0) {
+        setCooldownSeconds(retrySecs);
+        setFeedback({
+          type: 'error',
+          text: `Rate limit active — you can send another alert in ${retrySecs}s.`,
+          isRateLimit: true,
+        });
+      } else {
+        setFeedback({
+          type: 'error',
+          text: result.error || 'Could not send message.',
+        });
+      }
     }
   };
+
+  const isCoolingDown = cooldownSeconds > 0;
+  const submitButtonLabel = formatCooldownButtonLabel(
+    cooldownSeconds,
+    sending ? 'Sending...' : 'Send Anonymous Message'
+  );
 
   return (
     <div className="animate-view-enter rounded-3xl border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#11141B] shadow-sm overflow-hidden">
@@ -163,20 +216,37 @@ export const PublicScannerPanel: React.FC<PublicScannerPanelProps> = ({
 
             {/* 1-Tap Quick Alerts */}
             <div className="space-y-2">
-              <p className="text-xs font-semibold text-zinc-500 dark:text-zinc-400">
-                Quick Tap Alert
-              </p>
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs font-semibold text-zinc-500 dark:text-zinc-400">
+                  Quick Tap Alert
+                </p>
+                {isCoolingDown && (
+                  <span
+                    data-testid="scanner-cooldown-inline"
+                    className="inline-flex items-center gap-1 text-xs font-mono font-semibold tabular-nums text-amber-700 dark:text-amber-400"
+                  >
+                    <Clock className="w-3.5 h-3.5 shrink-0" />
+                    <span>Retry in {cooldownSeconds}s</span>
+                  </span>
+                )}
+              </div>
               <div className="grid grid-cols-1 gap-2">
                 {publicTag.quickPresets.map((preset) => (
                   <button
                     key={preset}
                     type="button"
-                    disabled={sending}
+                    disabled={sending || isCoolingDown}
                     onClick={() => handleSend(preset)}
-                    className="spring-transition min-h-[48px] text-left px-4 py-3 rounded-2xl border border-zinc-200 dark:border-white/[0.08] bg-zinc-50/40 dark:bg-[#151922] hover:border-emerald-600 dark:hover:border-emerald-500/60 hover:bg-emerald-50/40 dark:hover:bg-emerald-950/30 text-sm font-medium text-zinc-800 dark:text-zinc-200 flex items-center justify-between gap-3 cursor-pointer active:scale-[0.99] disabled:opacity-50"
+                    className="spring-transition min-h-[48px] text-left px-4 py-3 rounded-2xl border border-zinc-200 dark:border-white/[0.08] bg-zinc-50/40 dark:bg-[#151922] hover:border-emerald-600 dark:hover:border-emerald-500/60 hover:bg-emerald-50/40 dark:hover:bg-emerald-950/30 text-sm font-medium text-zinc-800 dark:text-zinc-200 flex items-center justify-between gap-3 cursor-pointer active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <span className="leading-snug">{preset}</span>
-                    <Send className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                    {isCoolingDown ? (
+                      <span className="font-mono tabular-nums text-xs text-amber-700 dark:text-amber-400 shrink-0">
+                        {cooldownSeconds}s
+                      </span>
+                    ) : (
+                      <Send className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                    )}
                   </button>
                 ))}
               </div>
@@ -210,11 +280,18 @@ export const PublicScannerPanel: React.FC<PublicScannerPanelProps> = ({
               />
               <button
                 type="submit"
-                disabled={sending || !messageText.trim()}
-                className="spring-transition w-full min-h-[48px] inline-flex items-center justify-center gap-2 rounded-2xl bg-zinc-900 dark:bg-emerald-500 hover:bg-zinc-800 dark:hover:bg-emerald-400 disabled:bg-zinc-200 dark:disabled:bg-[#1B202C] disabled:text-zinc-400 dark:disabled:text-zinc-500 text-white dark:text-emerald-950 font-semibold text-sm px-5 py-3.5 cursor-pointer active:scale-[0.99] whitespace-nowrap"
+                data-testid="scanner-send-button"
+                disabled={sending || isCoolingDown || !messageText.trim()}
+                className="spring-transition w-full min-h-[48px] inline-flex items-center justify-center gap-2 rounded-2xl bg-zinc-900 dark:bg-emerald-500 hover:bg-zinc-800 dark:hover:bg-emerald-400 disabled:bg-zinc-200 dark:disabled:bg-[#1B202C] disabled:text-zinc-500 dark:disabled:text-zinc-400 text-white dark:text-emerald-950 font-semibold text-sm px-5 py-3.5 cursor-pointer active:scale-[0.99] whitespace-nowrap"
               >
-                <Send className="w-4 h-4" />
-                <span>{sending ? 'Sending...' : 'Send Anonymous Message'}</span>
+                {isCoolingDown ? (
+                  <Clock className="w-4 h-4 shrink-0" />
+                ) : (
+                  <Send className="w-4 h-4 shrink-0" />
+                )}
+                <span className="font-mono sm:font-sans tabular-nums">
+                  {submitButtonLabel}
+                </span>
               </button>
             </form>
           </>
@@ -250,7 +327,11 @@ export const PublicScannerPanel: React.FC<PublicScannerPanelProps> = ({
             ) : (
               <AlertCircle className="w-4 h-4 shrink-0" />
             )}
-            <span>{feedback.text}</span>
+            <span>
+              {feedback.isRateLimit && isCoolingDown
+                ? `Rate limit reached — retry available in ${cooldownSeconds}s.`
+                : feedback.text}
+            </span>
           </div>
         )}
 
@@ -261,38 +342,66 @@ export const PublicScannerPanel: React.FC<PublicScannerPanelProps> = ({
               Recent Relay Replies
             </p>
             <div className="space-y-2 max-h-60 overflow-y-auto custom-scrollbar pr-1">
-              {messages.slice(-5).map((m) => (
-                <div
-                  key={m.id}
-                  className={`animate-msg-enter rounded-2xl px-4 py-3 text-xs ${
-                    m.sender === 'owner'
-                      ? 'bg-emerald-50/90 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-500/30 text-emerald-950 dark:text-emerald-100 ml-3 sm:ml-4'
-                      : 'bg-zinc-50 dark:bg-[#171B24] border border-zinc-200/80 dark:border-white/[0.07] text-zinc-800 dark:text-zinc-200 mr-3 sm:mr-4'
-                  }`}
-                >
-                  <div className="flex items-center justify-between text-[11px] opacity-75 mb-1">
-                    <span className="font-semibold">
-                      {m.sender === 'owner'
-                        ? m.viaTelegram || m.senderAlias.includes('Telegram')
-                          ? 'Driver Reply · via Telegram'
-                          : 'Driver Reply'
-                        : m.senderAlias}
-                    </span>
-                    <time
-                      data-testid="scanner-message-relative-time"
-                      dateTime={new Date(m.createdAt).toISOString()}
-                      title={new Date(m.createdAt).toLocaleTimeString([], {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                      })}
-                      className="font-mono tabular-nums"
-                    >
-                      {formatRelativeTimestamp(m.createdAt, nowMs)}
-                    </time>
+              {messages.slice(-5).map((m) => {
+                const deliveryStatus =
+                  m.sender === 'scanner'
+                    ? computeScannerMessageDeliveryStatus(m, messages)
+                    : null;
+
+                return (
+                  <div
+                    key={m.id}
+                    className={`animate-msg-enter rounded-2xl px-4 py-3 text-xs ${
+                      m.sender === 'owner'
+                        ? 'bg-emerald-50/90 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-500/30 text-emerald-950 dark:text-emerald-100 ml-3 sm:ml-4'
+                        : 'bg-zinc-50 dark:bg-[#171B24] border border-zinc-200/80 dark:border-white/[0.07] text-zinc-800 dark:text-zinc-200 mr-3 sm:mr-4'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2 text-[11px] opacity-75 mb-1">
+                      <span className="font-semibold truncate">
+                        {m.sender === 'owner'
+                          ? m.viaTelegram || m.senderAlias.includes('Telegram')
+                            ? 'Driver Reply · via Telegram'
+                            : 'Driver Reply'
+                          : m.senderAlias}
+                      </span>
+                      <time
+                        data-testid="scanner-message-relative-time"
+                        dateTime={new Date(m.createdAt).toISOString()}
+                        title={new Date(m.createdAt).toLocaleTimeString([], {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })}
+                        className="font-mono tabular-nums shrink-0"
+                      >
+                        {formatRelativeTimestamp(m.createdAt, nowMs)}
+                      </time>
+                    </div>
+                    <p className="text-sm leading-snug break-words">{m.text}</p>
+
+                    {deliveryStatus && (
+                      <div
+                        data-testid="scanner-delivery-status"
+                        data-delivery-stage={deliveryStatus.stage}
+                        className={`mt-2 pt-1.5 border-t border-zinc-200/60 dark:border-white/[0.06] flex items-center gap-1.5 text-[11px] font-medium ${
+                          deliveryStatus.stage === 'driver-replied'
+                            ? 'text-emerald-700 dark:text-emerald-400'
+                            : deliveryStatus.stage === 'delivered-telegram'
+                            ? 'text-emerald-700/90 dark:text-emerald-400/90'
+                            : 'text-zinc-500 dark:text-zinc-400'
+                        }`}
+                      >
+                        {deliveryStatus.stage === 'driver-replied' ? (
+                          <CheckCheck className="w-3.5 h-3.5 shrink-0" />
+                        ) : (
+                          <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                        )}
+                        <span>{deliveryStatus.label}</span>
+                      </div>
+                    )}
                   </div>
-                  <p className="text-sm leading-snug break-words">{m.text}</p>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
@@ -305,3 +414,4 @@ export const PublicScannerPanel: React.FC<PublicScannerPanelProps> = ({
     </div>
   );
 };
+

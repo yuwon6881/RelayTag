@@ -20,7 +20,12 @@ import {
   UserCheck,
   LogIn,
   LogOut,
+  Download,
+  RefreshCw,
+  KeyRound,
+  ShieldAlert,
 } from 'lucide-react';
+import QRCode from 'qrcode';
 import {
   onAuthStateChanged,
   signInWithPopup,
@@ -53,6 +58,9 @@ import {
   PublicTagView,
   QUICK_TIMER_PRESETS,
   MASKED_BOT_TOKEN,
+  AUTHORIZED_OWNER_EMAIL,
+  isAuthorizedOwnerEmail,
+  validateOwnerPinFormat,
   computeRemainingMinutes,
   isContactWindowActive,
   toPublicTagView,
@@ -60,7 +68,10 @@ import {
   formatAuthErrorForUi,
   shouldPollScannerBackend,
   hasTagSetupData,
+  normalizePersistedTagFields,
   RELATIVE_TIMESTAMP_REFRESH_MS,
+  buildDownloadableTagSvgBadge,
+  sanitizeBadgeFilename,
 } from './utils/relayLogic';
 import { QrCodeVector } from './components/QrCodeVector';
 import { PublicScannerPanel } from './components/PublicScannerPanel';
@@ -194,6 +205,26 @@ export default function App() {
     text: string;
   } | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [qrSvgMarkup, setQrSvgMarkup] = useState('');
+  const [downloadedFormat, setDownloadedFormat] = useState<'png' | 'svg' | null>(null);
+  const [confirmingRegenerate, setConfirmingRegenerate] = useState(false);
+  const [regeneratingCode, setRegeneratingCode] = useState(false);
+  const [regeneratedToast, setRegeneratedToast] = useState<string | null>(null);
+
+  // Owner Security Gate & PIN state
+  const [pinSessionUnlocked, setPinSessionUnlocked] = useState(false);
+  const [pinConfiguredOnServer, setPinConfiguredOnServer] = useState(false);
+  const [showGatePinForm, setShowGatePinForm] = useState(false);
+  const [gatePinInput, setGatePinInput] = useState('');
+  const [gatePinError, setGatePinError] = useState<string | null>(null);
+  const [gatePinSubmitting, setGatePinSubmitting] = useState(false);
+  const [gateLookupCode, setGateLookupCode] = useState('');
+  const [newPinInput, setNewPinInput] = useState('');
+  const [pinSaving, setPinSaving] = useState(false);
+  const [pinFeedback, setPinFeedback] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
 
   const initializedRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -208,9 +239,24 @@ export default function App() {
   const privateConfigCreatedAtRef = useRef<Timestamp | null>(null);
   const privateBotTokenCacheRef = useRef<string>('');
 
+  const isSignedInAsAuthorizedOwner = Boolean(
+    currentUser && isAuthorizedOwnerEmail(currentUser.email)
+  );
+  const isSignedInAsUnauthorizedAccount = Boolean(
+    currentUser && !isAuthorizedOwnerEmail(currentUser.email)
+  );
+  const isOwnerConsoleUnlocked =
+    isSignedInAsAuthorizedOwner ||
+    (pinSessionUnlocked && !isSignedInAsUnauthorizedAccount);
+
   const ensureOwnerSession = useCallback(async (forceRefresh = false): Promise<string | null> => {
     if (!forceRefresh && ownerTokenRef.current) {
       return ownerTokenRef.current;
+    }
+    const activeUser = auth.currentUser;
+    const isAuthOwner = Boolean(activeUser && isAuthorizedOwnerEmail(activeUser.email));
+    if (!isAuthOwner && !ownerTokenRef.current) {
+      return null;
     }
     try {
       const headers: Record<string, string> = {
@@ -219,18 +265,44 @@ export default function App() {
       if (ownerTokenRef.current) {
         headers['X-Owner-Token'] = ownerTokenRef.current;
       }
-      if (auth.currentUser?.uid) {
-        headers['X-Firebase-Uid'] = auth.currentUser.uid;
+      if (activeUser && isAuthOwner) {
+        headers['X-Firebase-Uid'] = activeUser.uid;
+        if (activeUser.email) {
+          headers['X-Firebase-Email'] = activeUser.email;
+        }
+        try {
+          const idToken = await activeUser.getIdToken();
+          if (idToken) {
+            headers['Authorization'] = `Bearer ${idToken}`;
+          }
+        } catch {
+          // fallback to headers if offline/token fetch fails
+        }
       }
       const res = await fetch('/api/owner/session', {
         method: 'POST',
         headers,
         credentials: 'same-origin',
       });
-      if (!res.ok) return null;
+      if (!res.ok) {
+        if (res.status === 401 || res.status === 403) {
+          ownerTokenRef.current = null;
+          setPinSessionUnlocked(false);
+          try {
+            window.sessionStorage.removeItem('relaytag-owner-token');
+          } catch {
+            // ignore
+          }
+        }
+        return null;
+      }
       const data = await res.json();
+      if (typeof data.pinConfigured === 'boolean') {
+        setPinConfiguredOnServer(data.pinConfigured);
+      }
       if (typeof data.token === 'string' && data.token) {
         ownerTokenRef.current = data.token;
+        setPinSessionUnlocked(true);
         try {
           window.sessionStorage.setItem('relaytag-owner-token', data.token);
         } catch {
@@ -250,7 +322,12 @@ export default function App() {
       const buildHeaders = (tok: string | null) => {
         const h = new Headers(init.headers || {});
         if (tok) h.set('X-Owner-Token', tok);
-        if (auth.currentUser?.uid) h.set('X-Firebase-Uid', auth.currentUser.uid);
+        if (auth.currentUser && isAuthorizedOwnerEmail(auth.currentUser.email)) {
+          h.set('X-Firebase-Uid', auth.currentUser.uid);
+          if (auth.currentUser.email) {
+            h.set('X-Firebase-Email', auth.currentUser.email);
+          }
+        }
         return h;
       };
 
@@ -262,11 +339,13 @@ export default function App() {
 
       if (res.status === 401) {
         token = await ensureOwnerSession(true);
-        res = await fetch(input, {
-          ...init,
-          headers: buildHeaders(token),
-          credentials: 'same-origin',
-        });
+        if (token) {
+          res = await fetch(input, {
+            ...init,
+            headers: buildHeaders(token),
+            credentials: 'same-origin',
+          });
+        }
       }
       return res;
     },
@@ -283,42 +362,9 @@ export default function App() {
           return;
         }
 
-        // Zero-Backend-Wake DND Check: Race Firestore edge read (250ms budget) before hitting backend
         const fsPromise = /^[A-Z0-9-]+$/.test(cleanCode)
           ? getDoc(doc(db, 'tags', cleanCode)).catch(() => null)
           : Promise.resolve(null);
-
-        const quickFsSnap = await Promise.race([
-          fsPromise,
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 250)),
-        ]);
-
-        if (quickFsSnap && quickFsSnap.exists()) {
-          const fd = quickFsSnap.data();
-          const nowClient = Date.now();
-          const fsActive = isContactWindowActive(
-            Boolean(fd.contactEnabled),
-            typeof fd.autoExpireAt === 'number' ? fd.autoExpireAt : null,
-            nowClient
-          );
-          // If Reachable is OFF in Firestore, resolve immediately without hitting the backend
-          if (!fsActive) {
-            setPublicNotFoundError(null);
-            setPublicScanTag({
-              code: cleanCode,
-              vehicleLabel: String(fd.vehicleLabel || 'Registered Vehicle'),
-              plateHint: String(fd.plateNumber || ''),
-              contactEnabled: false,
-              statusNote: '',
-              quickPresets: [],
-              updatedAt: nowClient,
-            });
-            setMessages([]);
-            setNowMs(nowClient);
-            setLoading(false);
-            return;
-          }
-        }
 
         const sessionParam = encodeURIComponent(scannerSessionIdRef.current);
         const res = await fetch(
@@ -348,31 +394,44 @@ export default function App() {
         setNowMs(serverTime);
         setLoading(false);
 
-        // Apply Firestore overlay asynchronously if available
+        // Apply Firestore overlay asynchronously ONLY if Firestore document has a newer timestamp than the backend
         void fsPromise.then((fsSnap) => {
           if (!fsSnap || !fsSnap.exists()) return;
           const fd = fsSnap.data();
+          const fsUpdatedMs =
+            fd.updatedAt && typeof fd.updatedAt.toMillis === 'function'
+              ? fd.updatedAt.toMillis()
+              : 0;
+          if (fsUpdatedMs <= (resolvedPublicTag.updatedAt || 0) + 2000) {
+            return;
+          }
+          const normalized = normalizePersistedTagFields({
+            code: cleanCode,
+            vehicleLabel: fd.vehicleLabel,
+            plateNumber: fd.plateNumber,
+            statusNote: fd.statusNote,
+          });
           const fsActive = isContactWindowActive(
             Boolean(fd.contactEnabled),
             typeof fd.autoExpireAt === 'number' ? fd.autoExpireAt : null,
             serverTime
           );
-          const effectiveActive = fsActive && resolvedPublicTag.contactEnabled;
           setPublicScanTag((prev) =>
             prev
               ? {
                   ...prev,
-                  vehicleLabel: String(fd.vehicleLabel || '') || prev.vehicleLabel,
-                  plateHint: String(fd.plateNumber || '') || prev.plateHint,
-                  contactEnabled: effectiveActive,
-                  statusNote: effectiveActive
-                    ? String(fd.statusNote || '') || prev.statusNote
+                  vehicleLabel: normalized.vehicleLabel || prev.vehicleLabel,
+                  plateHint: normalized.plateHint || prev.plateHint,
+                  contactEnabled: fsActive,
+                  statusNote: fsActive
+                    ? normalized.statusNote || prev.statusNote
                     : '',
-                  quickPresets: effectiveActive ? prev.quickPresets : [],
+                  quickPresets: fsActive ? prev.quickPresets : [],
+                  updatedAt: fsUpdatedMs,
                 }
               : prev
           );
-          if (!effectiveActive) {
+          if (!fsActive) {
             setMessages([]);
           }
         });
@@ -380,11 +439,15 @@ export default function App() {
       }
 
       const res = await ownerFetch('/api/owner/state');
-      if (!res.ok) return;
+      if (!res.ok) {
+        setLoading(false);
+        return;
+      }
       const data = await res.json();
       const firstTag: OwnerTagView | undefined = data.tags?.[0];
       if (firstTag) {
         setTag(firstTag);
+        setPinConfiguredOnServer(Boolean(firstTag.ownerPinConfigured));
         if (!initializedRef.current) {
           setVehicleLabelInput(firstTag.vehicleLabel);
           setPlateNumberInput(firstTag.plateHint);
@@ -404,10 +467,55 @@ export default function App() {
     }
   }, [isPublicScanRoute, scannedCodeParam, ownerFetch]);
 
-  // Initial fetch on mount or route change
+  // Initial check of auth-status or public scan state on mount
   useEffect(() => {
-    fetchState();
-  }, [fetchState]);
+    if (isPublicScanRoute) {
+      fetchState();
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const headers: Record<string, string> = {};
+        if (ownerTokenRef.current) {
+          headers['X-Owner-Token'] = ownerTokenRef.current;
+        }
+        const res = await fetch('/api/owner/auth-status', {
+          headers,
+          credentials: 'same-origin',
+        });
+        if (!cancelled && res.ok) {
+          const data = await res.json();
+          const hasPin = Boolean(data.pinConfigured);
+          setPinConfiguredOnServer(hasPin);
+          if (hasPin) {
+            setShowGatePinForm(true);
+          }
+          if (data.authenticated) {
+            setPinSessionUnlocked(true);
+            await fetchState();
+            return;
+          } else {
+            ownerTokenRef.current = null;
+            try {
+              window.sessionStorage.removeItem('relaytag-owner-token');
+            } catch {
+              // ignore
+            }
+          }
+        }
+      } catch {
+        // ignore network check error
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [fetchState, isPublicScanRoute]);
 
   // Visibility-aware & DND-aware polling: completely halts backend polling when Reachable is OFF
   const shouldPoll = shouldPollScannerBackend({
@@ -449,50 +557,130 @@ export default function App() {
       setCurrentUser(user);
       setAuthLoading(false);
       if (user) {
+        if (!isAuthorizedOwnerEmail(user.email)) {
+          ownerTokenRef.current = null;
+          setPinSessionUnlocked(false);
+          try {
+            window.sessionStorage.removeItem('relaytag-owner-token');
+          } catch {
+            // ignore
+          }
+          setLoading(false);
+          return;
+        }
         try {
           await ensureOwnerSession(true);
-          const tagDocRef = doc(db, 'tags', 'RT-482-9XK');
+          const ownedTagsQuery = query(
+            collection(db, 'tags'),
+            where('ownerId', '==', user.uid)
+          );
           const privRef = doc(db, 'users', user.uid, 'private', 'config');
-          const [snap, privSnap] = await Promise.all([
-            getDoc(tagDocRef),
+          const [ownedSnap, privSnap] = await Promise.all([
+            getDocs(ownedTagsQuery),
             getDoc(privRef),
           ]);
 
-          const d = snap.exists() && snap.data().ownerId === user.uid ? snap.data() : null;
+          let d: Record<string, any> | null = null;
+          if (!ownedSnap.empty) {
+            const sortedDocs = [...ownedSnap.docs].sort((a, b) => {
+              const aMs =
+                a.data().updatedAt && typeof a.data().updatedAt.toMillis === 'function'
+                  ? a.data().updatedAt.toMillis()
+                  : 0;
+              const bMs =
+                b.data().updatedAt && typeof b.data().updatedAt.toMillis === 'function'
+                  ? b.data().updatedAt.toMillis()
+                  : 0;
+              return bMs - aMs;
+            });
+            d = sortedDocs[0].data();
+          } else {
+            const fallbackSnap = await getDoc(doc(db, 'tags', 'RT-482-9XK'));
+            if (fallbackSnap.exists() && fallbackSnap.data().ownerId === user.uid) {
+              d = fallbackSnap.data();
+            }
+          }
+
+          const activeTagCode =
+            d && typeof d.code === 'string' && /^[A-Z0-9-]{4,20}$/.test(d.code)
+              ? d.code
+              : 'RT-482-9XK';
+
           const pd = privSnap.exists() && privSnap.data().ownerId === user.uid ? privSnap.data() : null;
+          const normalizedCloud = d
+            ? normalizePersistedTagFields({
+                code: activeTagCode,
+                vehicleLabel: d.vehicleLabel,
+                plateNumber: d.plateNumber,
+                statusNote: d.statusNote,
+              })
+            : { vehicleLabel: '', plateHint: '', statusNote: '' };
+
           const isConfigured = hasTagSetupData({
-            vehicleLabel: d?.vehicleLabel,
-            plateNumber: d?.plateNumber,
-            statusNote: d?.statusNote,
+            code: activeTagCode,
+            vehicleLabel: normalizedCloud.vehicleLabel,
+            plateNumber: normalizedCloud.plateHint,
+            statusNote: normalizedCloud.statusNote,
             telegramEnabled: pd?.telegramEnabled,
             telegramBotToken: pd?.telegramBotToken,
             telegramChatId: pd?.telegramChatId,
           });
 
-          if (d) {
+          if (d && (isConfigured || Boolean(d.contactEnabled) || activeTagCode !== 'RT-482-9XK')) {
             if (d.createdAt) {
-              tagCreatedAtCacheRef.current['RT-482-9XK'] = d.createdAt;
+              tagCreatedAtCacheRef.current[activeTagCode] = d.createdAt;
             }
-            setVehicleLabelInput(d.vehicleLabel || '');
-            setPlateNumberInput(d.plateNumber || '');
-            setStatusNoteInput(d.statusNote || '');
+            setVehicleLabelInput(normalizedCloud.vehicleLabel);
+            setPlateNumberInput(normalizedCloud.plateHint);
+            setStatusNoteInput(normalizedCloud.statusNote);
             await ownerFetch('/api/owner/tags/tag-default', {
               method: 'PATCH',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                vehicleLabel: d.vehicleLabel,
-                plateHint: d.plateNumber,
-                statusNote: d.statusNote,
+                code: activeTagCode,
+                vehicleLabel: normalizedCloud.vehicleLabel,
+                plateHint: normalizedCloud.plateHint,
+                statusNote: normalizedCloud.statusNote,
                 contactEnabled:
-                  isConfigured && typeof d.contactEnabled === 'boolean'
-                    ? d.contactEnabled
-                    : false,
+                  typeof d.contactEnabled === 'boolean' ? d.contactEnabled : false,
                 autoExpireAt:
-                  isConfigured && typeof d.autoExpireAt === 'number' && d.autoExpireAt > 0
+                  typeof d.autoExpireAt === 'number' && d.autoExpireAt > 0
                     ? d.autoExpireAt
                     : null,
               }),
             });
+          } else {
+            if (d?.createdAt) {
+              tagCreatedAtCacheRef.current[activeTagCode] = d.createdAt;
+            }
+            // User signed in with no existing cloud tag doc (or an unconfigured default doc) — persist current server tag state to Firestore
+            const stateRes = await ownerFetch('/api/owner/state');
+            if (stateRes.ok) {
+              const stateJson = await stateRes.json();
+              const currentServerTag: OwnerTagView | undefined = stateJson.tags?.[0];
+              if (currentServerTag) {
+                const ref = doc(db, 'tags', currentServerTag.code);
+                const snap = await getDoc(ref);
+                if (!snap.exists() || snap.data().ownerId === user.uid) {
+                  const normLocal = normalizePersistedTagFields(currentServerTag);
+                  await setDoc(
+                    ref,
+                    {
+                      code: currentServerTag.code,
+                      ownerId: user.uid,
+                      vehicleLabel: normLocal.vehicleLabel || 'Registered Vehicle',
+                      plateNumber: normLocal.plateHint || currentServerTag.code,
+                      contactEnabled: currentServerTag.contactEnabled,
+                      autoExpireAt: currentServerTag.autoExpireAt ?? 0,
+                      statusNote: normLocal.statusNote || 'Contact via RelayTag',
+                      createdAt: snap.exists() ? snap.data().createdAt : serverTimestamp(),
+                      updatedAt: serverTimestamp(),
+                    },
+                    { merge: false }
+                  );
+                }
+              }
+            }
           }
 
           // Restore owner's private Telegram configuration from Firestore if present
@@ -517,24 +705,26 @@ export default function App() {
             });
             if (patchRes.ok) {
               const patchData = await patchRes.json();
-              if (patchData.vault?.vaultId && patchData.vault?.ciphertext) {
-                const vaultRef = doc(db, 'tags', 'RT-482-9XK', 'vault', patchData.vault.vaultId);
+              if (patchData.vault?.vaultId && patchData.vault?.ciphertext && d) {
+                const vaultRef = doc(db, 'tags', activeTagCode, 'vault', patchData.vault.vaultId);
                 const vaultSnap = await getDoc(vaultRef);
-                const existingVaultCreatedAt = vaultSnap.exists() ? vaultSnap.data().createdAt : null;
-                await setDoc(vaultRef, {
-                  tagCode: 'RT-482-9XK',
-                  ownerId: user.uid,
-                  ciphertext: String(patchData.vault.ciphertext).slice(0, 1024),
-                  createdAt: existingVaultCreatedAt || serverTimestamp(),
-                  updatedAt: serverTimestamp(),
-                });
+                if (!vaultSnap.exists() || vaultSnap.data().ownerId === user.uid) {
+                  const existingVaultCreatedAt = vaultSnap.exists() ? vaultSnap.data().createdAt : null;
+                  await setDoc(vaultRef, {
+                    tagCode: activeTagCode,
+                    ownerId: user.uid,
+                    ciphertext: String(patchData.vault.ciphertext).slice(0, 1024),
+                    createdAt: existingVaultCreatedAt || serverTimestamp(),
+                    updatedAt: serverTimestamp(),
+                  });
+                }
               }
             }
           }
 
           // Hydrate persisted Firestore messages into server state so message history survives cold starts
           const msgQuery = query(
-            collection(db, 'tags', 'RT-482-9XK', 'messages'),
+            collection(db, 'tags', activeTagCode, 'messages'),
             where('ownerId', '==', user.uid)
           );
           const msgSnap = await getDocs(msgQuery);
@@ -605,16 +795,18 @@ export default function App() {
         }
       }
 
+      const normalized = normalizePersistedTagFields(updatedTag);
+
       await setDoc(
         ref,
         {
           code: updatedTag.code,
           ownerId: currentUser.uid,
-          vehicleLabel: updatedTag.vehicleLabel || '',
-          plateNumber: updatedTag.plateHint || '',
+          vehicleLabel: normalized.vehicleLabel || 'Registered Vehicle',
+          plateNumber: normalized.plateHint || updatedTag.code,
           contactEnabled: updatedTag.contactEnabled,
           autoExpireAt: updatedTag.autoExpireAt ?? 0,
-          statusNote: updatedTag.statusNote || '',
+          statusNote: normalized.statusNote || 'Contact via RelayTag',
           createdAt: cachedCreatedAt || serverTimestamp(),
           updatedAt: serverTimestamp(),
         },
@@ -664,10 +856,7 @@ export default function App() {
   const handleGoogleSignIn = async () => {
     setAuthError(null);
     try {
-      const cred = await signInWithPopup(auth, googleProvider);
-      if (cred.user && tag) {
-        await syncTagToFirestore(tag);
-      }
+      await signInWithPopup(auth, googleProvider);
     } catch (err) {
       const formatted = formatAuthErrorForUi(err);
       if (formatted) {
@@ -677,7 +866,181 @@ export default function App() {
   };
 
   const handleSignOut = async () => {
-    await signOut(auth);
+    try {
+      await fetch('/api/owner/logout', {
+        method: 'POST',
+        headers: ownerTokenRef.current
+          ? { 'X-Owner-Token': ownerTokenRef.current }
+          : {},
+        credentials: 'same-origin',
+      });
+    } catch {
+      // ignore logout network error
+    }
+    ownerTokenRef.current = null;
+    setPinSessionUnlocked(false);
+    try {
+      window.sessionStorage.removeItem('relaytag-owner-token');
+    } catch {
+      // ignore
+    }
+    if (auth.currentUser) {
+      await signOut(auth);
+    }
+  };
+
+  const handleUnlockWithPin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setGatePinError(null);
+    const validation = validateOwnerPinFormat(gatePinInput);
+    if (!validation.valid) {
+      setGatePinError(validation.error || 'Enter a valid 4 to 8 digit PIN.');
+      return;
+    }
+    setGatePinSubmitting(true);
+    try {
+      const res = await fetch('/api/owner/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ pin: validation.cleanPin }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setGatePinError(data.error || 'Invalid Owner Security PIN.');
+        return;
+      }
+      if (typeof data.token === 'string' && data.token) {
+        ownerTokenRef.current = data.token;
+        try {
+          window.sessionStorage.setItem('relaytag-owner-token', data.token);
+        } catch {
+          // ignore
+        }
+        setGatePinInput('');
+        setPinSessionUnlocked(true);
+        setLoading(true);
+        await fetchState();
+      }
+    } catch {
+      setGatePinError('Could not verify PIN. Please try again.');
+    } finally {
+      setGatePinSubmitting(false);
+    }
+  };
+
+  const handleSaveSecurityPin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!tag || pinSaving) return;
+    setPinFeedback(null);
+    const validation = validateOwnerPinFormat(newPinInput);
+    if (!validation.valid) {
+      setPinFeedback({
+        type: 'error',
+        text: validation.error || 'PIN must be 4 to 8 digits.',
+      });
+      return;
+    }
+    setPinSaving(true);
+    try {
+      const res = await ownerFetch(`/api/owner/tags/${tag.id}/security-pin`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin: validation.cleanPin }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setPinFeedback({
+          type: 'error',
+          text: data.error || 'Could not save Security PIN.',
+        });
+        return;
+      }
+      if (typeof data.token === 'string' && data.token) {
+        ownerTokenRef.current = data.token;
+        try {
+          window.sessionStorage.setItem('relaytag-owner-token', data.token);
+        } catch {
+          // ignore
+        }
+      }
+      setTag(data.tag);
+      setPinConfiguredOnServer(Boolean(data.pinConfigured));
+      setNewPinInput('');
+      if (currentUser && data.vault?.vaultId && data.vault?.ciphertext) {
+        try {
+          await syncTagToFirestore(data.tag);
+          const vaultRef = doc(db, 'tags', data.tag.code, 'vault', data.vault.vaultId);
+          const vaultSnap = await getDoc(vaultRef);
+          const existingVaultCreatedAt = vaultSnap.exists() ? vaultSnap.data().createdAt : null;
+          await setDoc(vaultRef, {
+            tagCode: data.tag.code,
+            ownerId: currentUser.uid,
+            ciphertext: String(data.vault.ciphertext).slice(0, 1024),
+            createdAt: existingVaultCreatedAt || serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        } catch {
+          // non-fatal vault sync
+        }
+      }
+      setPinFeedback({
+        type: 'success',
+        text: 'Owner Security PIN active. Previous sessions were rotated; you can now unlock the console with this PIN or your Google account.',
+      });
+    } finally {
+      setPinSaving(false);
+    }
+  };
+
+  const handleRemoveSecurityPin = async () => {
+    if (!tag || pinSaving) return;
+    setPinFeedback(null);
+    setPinSaving(true);
+    try {
+      const res = await ownerFetch(`/api/owner/tags/${tag.id}/security-pin`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ remove: true }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        if (typeof data.token === 'string' && data.token) {
+          ownerTokenRef.current = data.token;
+          try {
+            window.sessionStorage.setItem('relaytag-owner-token', data.token);
+          } catch {
+            // ignore
+          }
+        }
+        setTag(data.tag);
+        setPinConfiguredOnServer(false);
+        setNewPinInput('');
+        if (currentUser && data.vault?.vaultId && data.vault?.ciphertext) {
+          try {
+            await syncTagToFirestore(data.tag);
+            const vaultRef = doc(db, 'tags', data.tag.code, 'vault', data.vault.vaultId);
+            const vaultSnap = await getDoc(vaultRef);
+            const existingVaultCreatedAt = vaultSnap.exists() ? vaultSnap.data().createdAt : null;
+            await setDoc(vaultRef, {
+              tagCode: data.tag.code,
+              ownerId: currentUser.uid,
+              ciphertext: String(data.vault.ciphertext).slice(0, 1024),
+              createdAt: existingVaultCreatedAt || serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          } catch {
+            // non-fatal vault sync
+          }
+        }
+        setPinFeedback({
+          type: 'success',
+          text: 'Security PIN removed and prior PIN sessions revoked. Google Sign-In is required to unlock the console.',
+        });
+      }
+    } finally {
+      setPinSaving(false);
+    }
   };
 
   const handleToggle = async (
@@ -826,6 +1189,15 @@ export default function App() {
   const handleTelegramToggleSwitch = async () => {
     const nextEnabled = !telegramEnabled;
     setTelegramEnabled(nextEnabled);
+    // If enabling before credentials are typed, update switch state locally without firing an immediate validation error
+    const hasToken = Boolean(
+      telegramBotToken.trim() || tag?.telegramBotTokenConfigured
+    );
+    const hasChat = Boolean(telegramChatId.trim());
+    if (nextEnabled && (!hasToken || !hasChat)) {
+      setTelegramFeedback(null);
+      return;
+    }
     await persistTelegramSettings(
       nextEnabled,
       telegramBotToken,
@@ -925,19 +1297,22 @@ export default function App() {
     e.preventDefault();
     if (!tag || !replyText.trim()) return;
     setReplySending(true);
-    const res = await ownerFetch(`/api/owner/tags/${tag.id}/reply`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: replyText }),
-    });
-    setReplySending(false);
-    if (res.ok) {
-      const data = await res.json();
-      setReplyText('');
-      if (currentUser && data.message) {
-        await syncMessageToFirestore(tag.code, data.message, currentUser.uid);
+    try {
+      const res = await ownerFetch(`/api/owner/tags/${tag.id}/reply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: replyText }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setReplyText('');
+        if (currentUser && data.message) {
+          await syncMessageToFirestore(tag.code, data.message, currentUser.uid).catch(() => {});
+        }
+        await fetchState();
       }
-      fetchState();
+    } finally {
+      setReplySending(false);
     }
   };
 
@@ -985,10 +1360,17 @@ export default function App() {
       const data = await res.json();
       if (!res.ok) {
         await fetchState();
-        return { ok: false, error: data.error || 'Message rejected' };
+        return {
+          ok: false,
+          error: data.error || 'Message rejected',
+          retryAfterSeconds:
+            typeof data.retryAfterSeconds === 'number'
+              ? data.retryAfterSeconds
+              : undefined,
+        };
       }
       if (data.message) {
-        await syncMessageToFirestore(targetCode.toUpperCase(), data.message);
+        await syncMessageToFirestore(targetCode.toUpperCase(), data.message).catch(() => {});
       }
       await fetchState();
       return { ok: true, telegramForwarded: data.telegramForwarded };
@@ -1054,11 +1436,222 @@ export default function App() {
           <div className="flex items-center justify-center pt-1">
             <a
               href="/"
-              className="text-xs font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white underline underline-offset-4 py-2 px-3"
+              className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white underline underline-offset-4 py-2 px-3"
             >
-              Vehicle Owner? Open RelayTag Console
+              <Lock className="w-3 h-3" />
+              <span>Vehicle Owner? Unlock Protected Console</span>
             </a>
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ============================================================================
+  // OWNER SECURITY GATE (Blocks unauthorized users from viewing/modifying console)
+  // ============================================================================
+  if (!isOwnerConsoleUnlocked) {
+    if (authLoading || loading) {
+      return (
+        <div className="h-dvh flex items-center justify-center bg-[#F4F5F7] dark:bg-[#090B0E] text-zinc-500 dark:text-zinc-400 text-sm font-medium">
+          Verifying Owner Access...
+        </div>
+      );
+    }
+
+    return (
+      <div
+        data-testid="owner-security-gate"
+        className="min-h-dvh bg-[#F4F5F7] dark:bg-[#090B0E] text-zinc-900 dark:text-zinc-100 flex flex-col justify-between sm:justify-center py-5 sm:py-10 px-4"
+      >
+        <div className="max-w-md w-full mx-auto my-auto space-y-4">
+          {/* Top Brand & Theme Bar */}
+          <div className="flex items-center justify-between px-1">
+            <div className="flex items-center gap-2">
+              <div className="w-7 h-7 rounded-lg bg-zinc-900 dark:bg-emerald-500 text-white dark:text-emerald-950 flex items-center justify-center font-display font-bold text-xs shrink-0">
+                RT
+              </div>
+              <span className="font-display font-bold text-sm tracking-tight">
+                RelayTag Owner Guard
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={toggleTheme}
+              aria-label="Toggle dark or light theme"
+              className="spring-transition min-w-[40px] min-h-[40px] flex items-center justify-center rounded-xl border border-zinc-200 dark:border-white/[0.08] bg-white dark:bg-[#11141B] text-zinc-600 dark:text-zinc-300 hover:text-zinc-900 dark:hover:text-white cursor-pointer"
+            >
+              {isDark ? (
+                <Sun className="w-4 h-4 text-amber-400" />
+              ) : (
+                <Moon className="w-4 h-4" />
+              )}
+            </button>
+          </div>
+
+          {/* Protected Console Card */}
+          <section className="rounded-3xl border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#11141B] p-6 sm:p-7 shadow-sm space-y-5">
+            <div className="space-y-2">
+              <div className="inline-flex items-center gap-1.5 text-xs font-mono font-semibold text-emerald-700 dark:text-emerald-400">
+                <ShieldCheck className="w-4 h-4 shrink-0" />
+                <span>OWNER AUTHENTICATION REQUIRED</span>
+              </div>
+              <h1 className="font-display text-2xl font-bold tracking-tight text-zinc-900 dark:text-zinc-100">
+                Protected Vehicle Console
+              </h1>
+              <p className="text-xs sm:text-sm text-zinc-500 dark:text-zinc-400 leading-relaxed">
+                This RelayTag dashboard is locked to prevent unauthorized visitors from changing your reachability status, reading private messages, or modifying vehicle details.
+              </p>
+            </div>
+
+            {isSignedInAsUnauthorizedAccount && (
+              <div
+                role="alert"
+                data-testid="unauthorized-account-alert"
+                className="rounded-2xl border border-red-200 dark:border-red-500/30 bg-red-50/90 dark:bg-red-950/40 p-4 space-y-2.5"
+              >
+                <div className="flex items-start gap-2.5">
+                  <ShieldAlert className="w-4 h-4 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
+                  <div className="space-y-1 text-xs">
+                    <p className="font-bold text-red-900 dark:text-red-200">
+                      Unauthorized Google Account
+                    </p>
+                    <p className="text-red-800/90 dark:text-red-300/90 leading-relaxed">
+                      Signed in as <span className="font-mono font-semibold">{currentUser?.email}</span>. Only the registered vehicle owner (<span className="font-mono">{AUTHORIZED_OWNER_EMAIL}</span>) can unlock this console.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleSignOut}
+                  className="spring-transition w-full min-h-[40px] inline-flex items-center justify-center gap-1.5 rounded-xl bg-red-600 hover:bg-red-700 text-white text-xs font-semibold px-3.5 py-2 cursor-pointer"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span>Sign Out & Switch Account</span>
+                </button>
+              </div>
+            )}
+
+            <div className="space-y-3">
+              <button
+                type="button"
+                data-testid="owner-google-signin-button"
+                onClick={handleGoogleSignIn}
+                className="spring-transition w-full min-h-[48px] inline-flex items-center justify-center gap-2 rounded-2xl bg-zinc-900 dark:bg-emerald-500 hover:bg-zinc-800 dark:hover:bg-emerald-400 text-white dark:text-emerald-950 font-semibold text-xs sm:text-sm px-4 py-3 cursor-pointer active:scale-98 shadow-xs"
+              >
+                <LogIn className="w-4 h-4 shrink-0" />
+                <span>Sign In with Authorized Google Account</span>
+              </button>
+
+              {authError && (
+                <p className="text-xs text-red-600 dark:text-red-400 text-center">
+                  {authError}
+                </p>
+              )}
+
+              {/* Owner Security PIN Unlock Option */}
+              {!isSignedInAsUnauthorizedAccount && (
+                <div className="pt-1">
+                  {!showGatePinForm && !pinConfiguredOnServer ? (
+                    <button
+                      type="button"
+                      onClick={() => setShowGatePinForm(true)}
+                      className="w-full min-h-[40px] inline-flex items-center justify-center gap-1.5 rounded-xl text-xs font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200 py-2 cursor-pointer"
+                    >
+                      <KeyRound className="w-3.5 h-3.5" />
+                      <span>Have an Owner Security PIN? Unlock with PIN</span>
+                    </button>
+                  ) : (
+                    <form
+                      onSubmit={handleUnlockWithPin}
+                      className="rounded-2xl border border-zinc-200/80 dark:border-white/[0.08] bg-zinc-50/70 dark:bg-[#0B0E14] p-3.5 space-y-2.5"
+                    >
+                      <label
+                        htmlFor="gate-pin-input"
+                        className="flex items-center justify-between text-xs font-semibold text-zinc-700 dark:text-zinc-300"
+                      >
+                        <span className="inline-flex items-center gap-1.5">
+                          <KeyRound className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                          <span>Owner Security PIN</span>
+                        </span>
+                        <span className="font-mono text-[11px] text-zinc-400">4–8 digits</span>
+                      </label>
+                      <div className="flex gap-2">
+                        <input
+                          id="gate-pin-input"
+                          data-testid="gate-pin-input"
+                          type="password"
+                          inputMode="numeric"
+                          autoComplete="current-password"
+                          maxLength={8}
+                          value={gatePinInput}
+                          onChange={(e) =>
+                            setGatePinInput(e.target.value.replace(/\D/g, '').slice(0, 8))
+                          }
+                          placeholder="••••"
+                          className="flex-1 min-w-0 rounded-xl border border-zinc-200 dark:border-white/[0.1] bg-white dark:bg-[#121620] px-3.5 py-2 text-base sm:text-sm font-mono tracking-widest text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:border-zinc-900 dark:focus:border-emerald-500/60 focus:outline-none"
+                        />
+                        <button
+                          type="submit"
+                          data-testid="gate-pin-submit"
+                          disabled={gatePinSubmitting || gatePinInput.length < 4}
+                          className="spring-transition min-h-[42px] rounded-xl bg-zinc-900 dark:bg-emerald-500 hover:bg-zinc-800 dark:hover:bg-emerald-400 disabled:opacity-50 text-white dark:text-emerald-950 font-semibold text-xs px-4 py-2 cursor-pointer shrink-0"
+                        >
+                          {gatePinSubmitting ? 'Checking...' : 'Unlock'}
+                        </button>
+                      </div>
+                      {gatePinError && (
+                        <p
+                          role="alert"
+                          className="text-[11px] font-medium text-red-600 dark:text-red-400"
+                        >
+                          {gatePinError}
+                        </p>
+                      )}
+                    </form>
+                  )}
+                </div>
+              )}
+            </div>
+          </section>
+
+          {/* Passerby Redirect Helper */}
+          <section className="rounded-3xl border border-zinc-200/80 dark:border-white/[0.07] bg-white/80 dark:bg-[#11141B]/80 p-4 sm:p-5 space-y-2.5">
+            <div className="flex items-center gap-2 text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+              <Car className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+              <span>Scanning a parked vehicle?</span>
+            </div>
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              Passersby do not need an account. Scan the windshield QR code or enter the tag code below to contact the driver:
+            </p>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const clean = gateLookupCode.trim().toUpperCase();
+                if (clean) {
+                  window.location.href = `/?scan=${encodeURIComponent(clean)}`;
+                }
+              }}
+              className="flex gap-2"
+            >
+              <input
+                type="text"
+                maxLength={20}
+                value={gateLookupCode}
+                onChange={(e) => setGateLookupCode(e.target.value.toUpperCase())}
+                placeholder="e.g. RT-482-9XK"
+                aria-label="Windshield Tag Code"
+                className="flex-1 min-w-0 rounded-xl border border-zinc-200 dark:border-white/[0.09] bg-zinc-50 dark:bg-[#0B0E14] px-3.5 py-2 text-base sm:text-xs font-mono uppercase tracking-wider text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:bg-white dark:focus:bg-[#121620] focus:outline-none"
+              />
+              <button
+                type="submit"
+                disabled={!gateLookupCode.trim()}
+                className="spring-transition min-h-[40px] rounded-xl border border-zinc-200 dark:border-white/[0.1] bg-zinc-900 dark:bg-[#1A202C] hover:bg-zinc-800 dark:hover:bg-[#242C3D] disabled:opacity-40 text-white text-xs font-semibold px-3.5 py-2 cursor-pointer whitespace-nowrap"
+              >
+                Open Tag
+              </button>
+            </form>
+          </section>
         </div>
       </div>
     );
@@ -1104,6 +1697,8 @@ export default function App() {
     try {
       if (!isContactActive) {
         await handleToggle(true, null);
+      } else if (currentUser) {
+        await syncTagToFirestore(tag).catch(() => {});
       }
       const res = await handlePublicSendMessage({
         text: 'Simulated test scan: Checking in-app relay & Telegram phone alert.',
@@ -1182,6 +1777,183 @@ export default function App() {
     navigator.clipboard?.writeText(scanUrl);
     setCopiedLink(true);
     setTimeout(() => setCopiedLink(false), 2000);
+  };
+
+  const handleDownloadSvgBadge = async () => {
+    let rawQrSvg = qrSvgMarkup;
+    if (!rawQrSvg) {
+      rawQrSvg = await QRCode.toString(scanUrl, {
+        type: 'svg',
+        margin: 1,
+        width: 352,
+        color: { dark: '#141413', light: '#FFFFFF' },
+        errorCorrectionLevel: 'M',
+      });
+    }
+    const svgBadge = buildDownloadableTagSvgBadge({
+      code: tag.code,
+      plateHint: tag.plateHint,
+      vehicleLabel: tag.vehicleLabel,
+      qrSvgMarkup: rawQrSvg,
+    });
+    const blob = new Blob([svgBadge], { type: 'image/svg+xml;charset=utf-8' });
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = sanitizeBadgeFilename(tag.code, 'svg');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1500);
+    setDownloadedFormat('svg');
+    setTimeout(() => setDownloadedFormat(null), 2200);
+  };
+
+  const handleDownloadPngBadge = async () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1080;
+    canvas.height = 1320;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Outer ambient surface
+    ctx.fillStyle = '#F4F5F7';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Inner card container
+    ctx.fillStyle = '#FFFFFF';
+    ctx.strokeStyle = '#E4E4E7';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    if (typeof ctx.roundRect === 'function') {
+      ctx.roundRect(44, 44, 992, 1232, 56);
+    } else {
+      ctx.rect(44, 44, 992, 1232);
+    }
+    ctx.fill();
+    ctx.stroke();
+
+    // Kicker: WINDSHIELD TAG · CODE
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#047857';
+    ctx.font = '700 28px "JetBrains Mono", monospace';
+    ctx.fillText(`WINDSHIELD TAG · ${tag.code}`, 540, 152);
+
+    // Main Headline
+    ctx.fillStyle = '#111318';
+    ctx.font = '800 54px "Plus Jakarta Sans", -apple-system, sans-serif';
+    ctx.fillText('Scan to Contact Driver', 540, 228);
+
+    // Plate & Vehicle Subtitle
+    const subtitle =
+      tag.plateHint && tag.vehicleLabel
+        ? `${tag.plateHint} · ${tag.vehicleLabel}`
+        : tag.plateHint || tag.vehicleLabel || 'Registered Vehicle';
+    ctx.fillStyle = '#52525B';
+    ctx.font = '600 30px "JetBrains Mono", monospace';
+    ctx.fillText(subtitle.slice(0, 48), 540, 286);
+
+    // QR Code Frame
+    ctx.fillStyle = '#FFFFFF';
+    ctx.strokeStyle = '#E4E4E7';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    if (typeof ctx.roundRect === 'function') {
+      ctx.roundRect(210, 340, 660, 660, 44);
+    } else {
+      ctx.rect(210, 340, 660, 660);
+    }
+    ctx.fill();
+    ctx.stroke();
+
+    const qrCanvas = document.createElement('canvas');
+    await QRCode.toCanvas(qrCanvas, scanUrl, {
+      width: 580,
+      margin: 1,
+      color: { dark: '#141413', light: '#FFFFFF' },
+      errorCorrectionLevel: 'M',
+    });
+    ctx.drawImage(qrCanvas, 250, 380, 580, 580);
+
+    // Footer lines
+    ctx.fillStyle = '#3F3F46';
+    ctx.font = '600 28px "Plus Jakarta Sans", -apple-system, sans-serif';
+    ctx.fillText('Anonymous 2-Way Windshield Relay', 540, 1096);
+
+    ctx.fillStyle = '#71717A';
+    ctx.font = '500 24px "Plus Jakarta Sans", -apple-system, sans-serif';
+    ctx.fillText('Phone numbers stay hidden · Driver reachable when Contact is ON', 540, 1146);
+
+    const pngUrl = canvas.toDataURL('image/png');
+    const link = document.createElement('a');
+    link.href = pngUrl;
+    link.download = sanitizeBadgeFilename(tag.code, 'png');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setDownloadedFormat('png');
+    setTimeout(() => setDownloadedFormat(null), 2200);
+  };
+
+  const handleRegenerateTagCode = async () => {
+    if (!tag || regeneratingCode) return;
+    if (!confirmingRegenerate) {
+      setConfirmingRegenerate(true);
+      return;
+    }
+
+    setRegeneratingCode(true);
+    setRegeneratedToast(null);
+    try {
+      const res = await ownerFetch(`/api/owner/tags/${tag.id}/regenerate-code`, {
+        method: 'POST',
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      const prevCode: string | undefined = data.previousCode;
+      const updatedTag: OwnerTagView = data.tag;
+
+      setTag(updatedTag);
+      setMessages([]);
+      setNowMs(data.serverTime || Date.now());
+      setConfirmingRegenerate(false);
+      setRegeneratedToast(`New tag code active: ${updatedTag.code} (${prevCode} revoked)`);
+      setTimeout(() => setRegeneratedToast(null), 4000);
+
+      if (currentUser) {
+        await syncTagToFirestore(updatedTag);
+        if (data.vault?.vaultId && data.vault?.ciphertext) {
+          const vaultRef = doc(db, 'tags', updatedTag.code, 'vault', data.vault.vaultId);
+          await setDoc(vaultRef, {
+            tagCode: updatedTag.code,
+            ownerId: currentUser.uid,
+            ciphertext: String(data.vault.ciphertext).slice(0, 1024),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+
+        if (prevCode && prevCode !== updatedTag.code) {
+          try {
+            const oldMsgsQuery = query(
+              collection(db, 'tags', prevCode, 'messages'),
+              where('ownerId', '==', currentUser.uid)
+            );
+            const oldMsgsSnap = await getDocs(oldMsgsQuery);
+            await Promise.all(oldMsgsSnap.docs.map((dSnap) => deleteDoc(dSnap.ref)));
+            if (typeof data.previousVaultId === 'string' && data.previousVaultId) {
+              await deleteDoc(doc(db, 'tags', prevCode, 'vault', data.previousVaultId)).catch(() => {});
+            }
+            await deleteDoc(doc(db, 'tags', prevCode));
+            delete tagCreatedAtCacheRef.current[prevCode];
+          } catch {
+            // non-fatal cleanup of revoked tag
+          }
+        }
+      }
+    } finally {
+      setRegeneratingCode(false);
+    }
   };
 
   const isTelegramActive =
@@ -1268,6 +2040,18 @@ export default function App() {
               ) : (
                 <Moon className="w-4 h-4" />
               )}
+            </button>
+
+            <button
+              type="button"
+              data-testid="lock-console-button"
+              onClick={handleSignOut}
+              aria-label="Lock Owner Console"
+              title="Lock Owner Console"
+              className="spring-transition min-h-[38px] sm:min-h-[40px] inline-flex items-center gap-1.5 px-2.5 sm:px-3 rounded-xl border border-zinc-200 dark:border-white/[0.08] bg-white dark:bg-[#131720] hover:bg-red-50 dark:hover:bg-red-950/40 text-zinc-700 dark:text-zinc-200 hover:text-red-600 dark:hover:text-red-400 text-xs font-semibold cursor-pointer shadow-2xs active:scale-95 shrink-0"
+            >
+              <Lock className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Lock</span>
             </button>
           </div>
         </div>
@@ -1555,7 +2339,7 @@ export default function App() {
                     <input
                       id="status-note-input"
                       type="text"
-                      maxLength={140}
+                      maxLength={160}
                       value={statusNoteInput}
                       onChange={(e) => setStatusNoteInput(e.target.value)}
                       placeholder="Parked briefly near loading bay. Ping me if I need to move!"
@@ -1617,6 +2401,74 @@ export default function App() {
                     </p>
                   )}
                 </form>
+
+                {/* Owner Access Guard & Security PIN Configuration */}
+                <div className="pt-3 border-t border-zinc-100 dark:border-white/[0.07] space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+                      <KeyRound className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                      <span>Console PIN Lock</span>
+                    </span>
+                    <span
+                      className={`font-mono text-[11px] font-semibold ${
+                        pinConfiguredOnServer || tag.ownerPinConfigured
+                          ? 'text-emerald-700 dark:text-emerald-400'
+                          : 'text-zinc-400 dark:text-zinc-500'
+                      }`}
+                    >
+                      {pinConfiguredOnServer || tag.ownerPinConfigured ? 'PIN Active' : 'Google Auth Only'}
+                    </span>
+                  </div>
+
+                  <form onSubmit={handleSaveSecurityPin} className="flex items-center gap-2">
+                    <input
+                      type="password"
+                      inputMode="numeric"
+                      autoComplete="new-password"
+                      maxLength={8}
+                      value={newPinInput}
+                      onChange={(e) =>
+                        setNewPinInput(e.target.value.replace(/\D/g, '').slice(0, 8))
+                      }
+                      placeholder={
+                        pinConfiguredOnServer || tag.ownerPinConfigured
+                          ? 'Update 4–8 digit PIN'
+                          : 'Set 4–8 digit backup PIN'
+                      }
+                      aria-label="Set 4 to 8 digit Owner Security PIN"
+                      className="flex-1 min-w-0 rounded-xl border border-zinc-200 dark:border-white/[0.09] bg-zinc-50 dark:bg-[#0B0E14] px-3 py-1.5 text-base sm:text-xs font-mono tracking-wider text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:bg-white dark:focus:bg-[#121620] focus:outline-none"
+                    />
+                    <button
+                      type="submit"
+                      disabled={pinSaving || newPinInput.length < 4}
+                      className="spring-transition min-h-[36px] rounded-xl border border-zinc-200 dark:border-white/[0.1] bg-zinc-100 dark:bg-[#181C26] hover:bg-zinc-200 dark:hover:bg-[#222836] disabled:opacity-40 text-zinc-800 dark:text-zinc-200 text-xs font-semibold px-3 py-1.5 cursor-pointer whitespace-nowrap"
+                    >
+                      {pinSaving ? 'Saving...' : 'Save PIN'}
+                    </button>
+                    {(pinConfiguredOnServer || tag.ownerPinConfigured) && (
+                      <button
+                        type="button"
+                        disabled={pinSaving}
+                        onClick={handleRemoveSecurityPin}
+                        className="spring-transition min-h-[36px] rounded-xl text-xs font-medium text-zinc-500 hover:text-red-600 dark:hover:text-red-400 px-2 py-1.5 cursor-pointer whitespace-nowrap"
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </form>
+
+                  {pinFeedback && (
+                    <p
+                      className={`text-[11px] leading-snug ${
+                        pinFeedback.type === 'success'
+                          ? 'text-emerald-700 dark:text-emerald-400'
+                          : 'text-red-600 dark:text-red-400'
+                      }`}
+                    >
+                      {pinFeedback.text}
+                    </p>
+                  )}
+                </div>
               </section>
             </div>
           </div>
@@ -1708,6 +2560,7 @@ export default function App() {
             >
               <input
                 type="text"
+                maxLength={280}
                 value={replyText}
                 onChange={(e) => setReplyText(e.target.value)}
                 aria-label="Reply to scanner"
@@ -1856,11 +2709,14 @@ export default function App() {
           role="dialog"
           aria-modal="true"
           aria-labelledby="qr-modal-title"
-          className="animate-backdrop-enter fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4"
-          onClick={() => setShowQrModal(false)}
+          className="animate-backdrop-enter fixed inset-0 z-50 bg-black/70 print:bg-transparent backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4"
+          onClick={() => {
+            setShowQrModal(false);
+            setConfirmingRegenerate(false);
+          }}
         >
           <div
-            className="animate-modal-enter bg-white dark:bg-[#11141B] rounded-t-3xl sm:rounded-3xl border-t sm:border border-zinc-200 dark:border-white/[0.09] max-w-sm w-full max-h-[90dvh] overflow-y-auto p-6 pb-7 sm:pb-6 shadow-2xl space-y-4 text-center relative"
+            className="animate-modal-enter bg-white dark:bg-[#11141B] print:bg-white print:text-zinc-900 print:border-zinc-300 print:shadow-none rounded-t-3xl sm:rounded-3xl border-t sm:border border-zinc-200 dark:border-white/[0.09] max-w-sm w-full max-h-[92dvh] overflow-y-auto p-6 pb-7 sm:pb-6 shadow-2xl space-y-4 text-center relative"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Mobile Bottom Sheet Grab Handle */}
@@ -1871,7 +2727,10 @@ export default function App() {
 
             <button
               type="button"
-              onClick={() => setShowQrModal(false)}
+              onClick={() => {
+                setShowQrModal(false);
+                setConfirmingRegenerate(false);
+              }}
               aria-label="Close QR Modal"
               className="no-print absolute top-4 right-4 min-w-[44px] min-h-[44px] sm:min-w-0 sm:min-h-0 sm:w-8 sm:h-8 rounded-xl bg-zinc-100 dark:bg-[#191E29] hover:bg-zinc-200 dark:hover:bg-[#222836] border border-zinc-200/60 dark:border-white/[0.07] text-zinc-600 dark:text-zinc-300 flex items-center justify-center cursor-pointer spring-transition"
             >
@@ -1879,7 +2738,10 @@ export default function App() {
             </button>
 
             <div className="space-y-1 pt-1 sm:pt-0">
-              <p className="font-mono text-xs font-semibold text-emerald-700 dark:text-emerald-400">
+              <p
+                data-testid="qr-modal-tag-code"
+                className="font-mono text-xs font-semibold text-emerald-700 dark:text-emerald-400"
+              >
                 Windshield Tag · {tag.code}
               </p>
               <h2
@@ -1910,8 +2772,22 @@ export default function App() {
             </div>
 
             <div className="flex justify-center py-1">
-              <QrCodeVector url={scanUrl} size={184} />
+              <QrCodeVector
+                url={scanUrl}
+                size={184}
+                onSvgReady={setQrSvgMarkup}
+              />
             </div>
+
+            {regeneratedToast && (
+              <div
+                role="status"
+                data-testid="regenerated-tag-toast"
+                className="no-print animate-msg-enter rounded-xl bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-200 dark:border-emerald-500/30 px-3 py-2 text-xs font-medium text-emerald-900 dark:text-emerald-200"
+              >
+                {regeneratedToast}
+              </div>
+            )}
 
             <p className="text-xs text-zinc-500 dark:text-zinc-400 max-w-xs mx-auto leading-relaxed">
               Place this card inside your windshield. Scanners can only message you when your toggle is ON.
@@ -1926,6 +2802,47 @@ export default function App() {
                 <Printer className="w-4 h-4" />
                 <span>Print Windshield Card</span>
               </button>
+
+              {/* Downloadable PNG / SVG Badge Row */}
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  data-testid="download-qr-png"
+                  onClick={handleDownloadPngBadge}
+                  className="spring-transition min-h-[44px] inline-flex items-center justify-center gap-1.5 rounded-2xl border border-zinc-200 dark:border-white/[0.09] bg-zinc-50 dark:bg-[#181C26] hover:bg-zinc-100 dark:hover:bg-[#202634] text-zinc-800 dark:text-zinc-200 text-xs font-semibold py-2.5 px-3 cursor-pointer active:scale-95 whitespace-nowrap"
+                >
+                  {downloadedFormat === 'png' ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                      <span>PNG Saved</span>
+                    </>
+                  ) : (
+                    <>
+                      <Download className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                      <span>Download PNG</span>
+                    </>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="download-qr-svg"
+                  onClick={handleDownloadSvgBadge}
+                  className="spring-transition min-h-[44px] inline-flex items-center justify-center gap-1.5 rounded-2xl border border-zinc-200 dark:border-white/[0.09] bg-zinc-50 dark:bg-[#181C26] hover:bg-zinc-100 dark:hover:bg-[#202634] text-zinc-800 dark:text-zinc-200 text-xs font-semibold py-2.5 px-3 cursor-pointer active:scale-95 whitespace-nowrap"
+                >
+                  {downloadedFormat === 'svg' ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                      <span>SVG Saved</span>
+                    </>
+                  ) : (
+                    <>
+                      <Download className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                      <span>Download SVG</span>
+                    </>
+                  )}
+                </button>
+              </div>
 
               <button
                 type="button"
@@ -1947,11 +2864,51 @@ export default function App() {
 
               <a
                 href={scanUrl}
-                className="spring-transition w-full min-h-[40px] inline-flex items-center justify-center gap-1.5 rounded-2xl text-xs font-semibold text-emerald-700 dark:text-emerald-400 hover:underline py-2 px-4 whitespace-nowrap"
+                className="spring-transition w-full min-h-[40px] inline-flex items-center justify-center gap-1.5 rounded-2xl text-xs font-semibold text-emerald-700 dark:text-emerald-400 hover:underline py-1.5 px-4 whitespace-nowrap"
               >
                 <span>Preview Public Scanner Page</span>
                 <ChevronRight className="w-3.5 h-3.5" />
               </a>
+
+              {/* Tag Code Regeneration (Revoke & Rotate) */}
+              <div className="pt-2.5 mt-0.5 border-t border-zinc-100 dark:border-white/[0.07]">
+                {!confirmingRegenerate ? (
+                  <button
+                    type="button"
+                    data-testid="regenerate-tag-code-button"
+                    onClick={handleRegenerateTagCode}
+                    className="spring-transition w-full min-h-[40px] inline-flex items-center justify-center gap-1.5 rounded-xl text-xs font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200 hover:bg-zinc-100/70 dark:hover:bg-[#181C26] py-2 px-3 cursor-pointer whitespace-nowrap"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5 shrink-0" />
+                    <span>Rotate Tag Code (Revoke Old Card)</span>
+                  </button>
+                ) : (
+                  <div className="rounded-2xl bg-amber-50/80 dark:bg-amber-950/30 border border-amber-200/90 dark:border-amber-500/30 p-3 space-y-2 text-left">
+                    <p className="text-[11px] font-medium text-amber-900 dark:text-amber-200 leading-snug">
+                      Revoke <span className="font-mono font-bold">{tag.code}</span> and issue a new QR code? Any printed card with the old code will stop working immediately.
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        data-testid="confirm-regenerate-tag-code-button"
+                        disabled={regeneratingCode}
+                        onClick={handleRegenerateTagCode}
+                        className="spring-transition flex-1 min-h-[38px] inline-flex items-center justify-center gap-1.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold px-3 py-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${regeneratingCode ? 'animate-spin' : ''}`} />
+                        <span>{regeneratingCode ? 'Rotating...' : 'Confirm Rotate'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmingRegenerate(false)}
+                        className="spring-transition min-h-[38px] rounded-xl border border-zinc-200 dark:border-white/[0.1] bg-white dark:bg-[#181C26] text-zinc-700 dark:text-zinc-300 text-xs font-semibold px-3 py-1.5 cursor-pointer whitespace-nowrap"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>

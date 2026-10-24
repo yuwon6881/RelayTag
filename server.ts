@@ -7,6 +7,7 @@ import {
   type TagConfig,
   type RelayMessage,
   type TelegramIncomingUpdate,
+  AUTHORIZED_OWNER_EMAIL,
   isContactWindowActive,
   toOwnerTagView,
   resolveUpdatedBotToken,
@@ -16,7 +17,11 @@ import {
   checkScannerRateLimit,
   pruneRateLimitMap,
   resolveTargetScannerSession,
+  isAuthorizedOwnerEmail,
+  validateOwnerPinFormat,
+  evaluateOwnerSessionRequest,
   verifyOwnerAccess,
+  verifySameOriginRequest,
   validateIncomingMessage,
   validateOwnerReply,
   validateTelegramCredentials,
@@ -26,12 +31,15 @@ import {
   cleanupStoreState,
   createInitialTagConfig,
   hasTagSetupData,
+  normalizePersistedTagFields,
   extractClientIp,
   buildOwnerSessionCookie,
   computeHealthSummary,
+  generateNewTagCode,
 } from './src/utils/relayLogic.ts';
 
 const SERVER_STARTED_AT = Date.now();
+const OWNER_SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12-hour bounded session lifetime
 const DATA_FILE = path.join(os.tmpdir(), 'relaytag-store-v5.json');
 
 interface FirebaseAppletConfig {
@@ -50,15 +58,129 @@ const firebaseConfig: FirebaseAppletConfig = (() => {
   }
 })();
 
-const SERVER_VAULT_KEY = crypto.scryptSync(
+// Server-only secret entropy (never exposed to browser bundle) combined with project identifiers
+const SERVER_ONLY_ENTROPY =
+  process.env.RELAYTAG_VAULT_SECRET || process.env.GEMINI_API_KEY || '';
+
+const PRIMARY_VAULT_KEY = crypto.scryptSync(
+  `relaytag-vault-v2:${SERVER_ONLY_ENTROPY}:${firebaseConfig.projectId || ''}:${firebaseConfig.firestoreDatabaseId || ''}:${firebaseConfig.appId || 'relaytag-v1'}`,
+  'relaytag-aes-gcm-salt-v2',
+  32
+);
+
+// Config-derived & legacy fallback keys for backwards-compatible decryption of previously stored vaults
+const STABLE_VAULT_KEY = crypto.scryptSync(
+  `relaytag-vault:${firebaseConfig.projectId || ''}:${firebaseConfig.firestoreDatabaseId || ''}:${firebaseConfig.appId || 'relaytag-v1'}`,
+  'relaytag-aes-gcm-salt-v1',
+  32
+);
+
+const LEGACY_VAULT_KEY = crypto.scryptSync(
   `${process.env.GEMINI_API_KEY || ''}:${process.env.GOOGLE_CLOUD_PROJECT || ''}:${firebaseConfig.appId || 'relaytag-v1'}`,
   'relaytag-aes-gcm-salt-v1',
   32
 );
 
-function computeVaultId(tagCode: string): string {
+function hashOwnerPin(cleanPin: string): string {
+  const derived = crypto.scryptSync(`owner-pin:${cleanPin}`, PRIMARY_VAULT_KEY, 32);
+  return `pin_v1_${derived.toString('hex')}`;
+}
+
+function hashOwnerPinLegacy(cleanPin: string): string {
+  const derived = crypto.scryptSync(`owner-pin:${cleanPin}`, STABLE_VAULT_KEY, 32);
+  return `pin_v1_${derived.toString('hex')}`;
+}
+
+function verifyOwnerPinHash(candidatePin: unknown, storedHash?: string | null): boolean {
+  if (!storedHash || typeof storedHash !== 'string' || !storedHash.startsWith('pin_v1_')) {
+    return false;
+  }
+  const check = validateOwnerPinFormat(candidatePin);
+  if (!check.valid) return false;
+  const storedBuf = Buffer.from(storedHash, 'utf8');
+  const primaryBuf = Buffer.from(hashOwnerPin(check.cleanPin), 'utf8');
+  if (primaryBuf.length === storedBuf.length && crypto.timingSafeEqual(primaryBuf, storedBuf)) {
+    return true;
+  }
+  const legacyBuf = Buffer.from(hashOwnerPinLegacy(check.cleanPin), 'utf8');
+  if (legacyBuf.length === storedBuf.length && crypto.timingSafeEqual(legacyBuf, storedBuf)) {
+    return true;
+  }
+  return false;
+}
+
+function mintSignedOwnerToken(nowMs: number, pinHash?: string | null): string {
+  const issuedHex = nowMs.toString(16);
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const pinFingerprint = (pinHash || 'no-pin').slice(-12);
+  const sig = crypto
+    .createHmac('sha256', PRIMARY_VAULT_KEY)
+    .update(`sess:${issuedHex}:${nonce}:${pinFingerprint}`)
+    .digest('hex')
+    .slice(0, 32);
+  return `rt_own_v2_${issuedHex}_${nonce}_${sig}`;
+}
+
+function isSignedOwnerTokenValidAndFresh(
+  token: string | null | undefined,
+  nowMs: number,
+  pinHash?: string | null
+): boolean {
+  if (!token || typeof token !== 'string') return false;
+  const trimmed = token.trim();
+  if (!trimmed.startsWith('rt_own_v2_')) {
+    return false;
+  }
+  const parts = trimmed.split('_');
+  // ['rt', 'own', 'v2', issuedHex, nonce, sig]
+  if (parts.length !== 6) return false;
+  const [, , , issuedHex, nonce, sig] = parts;
+  const issuedMs = Number.parseInt(issuedHex, 16);
+  if (!Number.isFinite(issuedMs) || issuedMs <= 0) return false;
+  if (nowMs - issuedMs > OWNER_SESSION_TTL_MS || issuedMs > nowMs + 60_000) {
+    return false;
+  }
+  const pinFingerprint = (pinHash || 'no-pin').slice(-12);
+  const expectedSig = crypto
+    .createHmac('sha256', PRIMARY_VAULT_KEY)
+    .update(`sess:${issuedHex}:${nonce}:${pinFingerprint}`)
+    .digest('hex')
+    .slice(0, 32);
+  const a = Buffer.from(sig, 'utf8');
+  const b = Buffer.from(expectedSig, 'utf8');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function getActiveValidOwnerTokens(
+  store: StoreSchema,
+  nowMs: number,
+  pinHash?: string | null
+): Set<string> {
+  const rawList = Array.isArray(store.ownerTokens) ? store.ownerTokens : [];
+  const valid = new Set<string>();
+  for (const tok of rawList) {
+    if (isSignedOwnerTokenValidAndFresh(tok, nowMs, pinHash)) {
+      valid.add(tok);
+    }
+  }
+  if (valid.size !== rawList.length) {
+    store.ownerTokens = [...valid];
+  }
+  return valid;
+}
+
+function computeTelegramWebhookSecret(tagCode: string, botToken: string): string {
+  return crypto
+    .createHmac('sha256', PRIMARY_VAULT_KEY)
+    .update(`tg-webhook:${tagCode.trim().toUpperCase()}:${botToken.trim()}`)
+    .digest('hex')
+    .slice(0, 48);
+}
+
+function computeVaultId(tagCode: string, key: Buffer = PRIMARY_VAULT_KEY): string {
   const hmac = crypto
-    .createHmac('sha256', SERVER_VAULT_KEY)
+    .createHmac('sha256', key)
     .update(`vault:${tagCode.trim().toUpperCase()}`)
     .digest('hex')
     .slice(0, 32);
@@ -69,19 +191,39 @@ function encryptRelayVault(payload: {
   telegramEnabled: boolean;
   telegramBotToken: string;
   telegramChatId: string;
+  ownerPinHash?: string | null;
+  ownerEmail?: string | null;
 }): string {
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', SERVER_VAULT_KEY, iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', PRIMARY_VAULT_KEY, iv);
   const plain = JSON.stringify(payload);
   const encrypted = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
   const authTag = cipher.getAuthTag();
   return `v1:${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted.toString('hex')}`;
 }
 
-function decryptRelayVault(ciphertext: string): {
+function buildVaultForTag(tag: TagConfig): { vaultId: string; ciphertext: string } {
+  return {
+    vaultId: computeVaultId(tag.code),
+    ciphertext: encryptRelayVault({
+      telegramEnabled: tag.telegramEnabled,
+      telegramBotToken: tag.telegramBotToken,
+      telegramChatId: tag.telegramChatId,
+      ownerPinHash: tag.ownerPinHash || null,
+      ownerEmail: tag.ownerEmail || AUTHORIZED_OWNER_EMAIL,
+    }),
+  };
+}
+
+function decryptRelayVaultWithKey(
+  ciphertext: string,
+  key: Buffer
+): {
   telegramEnabled: boolean;
   telegramBotToken: string;
   telegramChatId: string;
+  ownerPinHash?: string | null;
+  ownerEmail?: string | null;
 } | null {
   try {
     const parts = ciphertext.split(':');
@@ -89,7 +231,7 @@ function decryptRelayVault(ciphertext: string): {
     const iv = Buffer.from(parts[1], 'hex');
     const authTag = Buffer.from(parts[2], 'hex');
     const encrypted = Buffer.from(parts[3], 'hex');
-    const decipher = crypto.createDecipheriv('aes-256-gcm', SERVER_VAULT_KEY, iv);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
     decipher.setAuthTag(authTag);
     const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
     const parsed = JSON.parse(decrypted);
@@ -98,12 +240,28 @@ function decryptRelayVault(ciphertext: string): {
         telegramEnabled: parsed.telegramEnabled,
         telegramBotToken: parsed.telegramBotToken,
         telegramChatId: typeof parsed.telegramChatId === 'string' ? parsed.telegramChatId : '',
+        ownerPinHash: typeof parsed.ownerPinHash === 'string' ? parsed.ownerPinHash : null,
+        ownerEmail: typeof parsed.ownerEmail === 'string' ? parsed.ownerEmail : null,
       };
     }
     return null;
   } catch {
     return null;
   }
+}
+
+function decryptRelayVault(ciphertext: string): {
+  telegramEnabled: boolean;
+  telegramBotToken: string;
+  telegramChatId: string;
+  ownerPinHash?: string | null;
+  ownerEmail?: string | null;
+} | null {
+  return (
+    decryptRelayVaultWithKey(ciphertext, PRIMARY_VAULT_KEY) ||
+    decryptRelayVaultWithKey(ciphertext, STABLE_VAULT_KEY) ||
+    decryptRelayVaultWithKey(ciphertext, LEGACY_VAULT_KEY)
+  );
 }
 
 interface StoreSchema {
@@ -116,17 +274,40 @@ interface StoreSchema {
 let memoryStore: StoreSchema | null = null;
 const scannerRateLimitMap = new Map<string, number[]>();
 const hydratedTagTimestamps = new Map<string, number>();
+const lastLocalMutationMap = new Map<string, number>();
+const missingTagLookupCache = new Map<string, number>();
 
-async function hydrateTagFromFirestoreIfNeeded(store: StoreSchema, tag: TagConfig): Promise<void> {
+function pruneBoundedTimestampMap(map: Map<string, number>, now: number, ttlMs: number, maxEntries = 500): void {
+  for (const [k, ts] of map.entries()) {
+    if (now - ts > ttlMs) {
+      map.delete(k);
+    }
+  }
+  if (map.size > maxEntries) {
+    const overflow = map.size - maxEntries;
+    const iter = map.keys();
+    for (let i = 0; i < overflow; i++) {
+      const next = iter.next();
+      if (next.done) break;
+      map.delete(next.value);
+    }
+  }
+}
+
+async function hydrateTagFromFirestoreIfNeeded(
+  store: StoreSchema,
+  tag: TagConfig,
+  forceLookup = false
+): Promise<boolean> {
   const code = tag.code.toUpperCase();
   const now = Date.now();
   const lastHydrated = hydratedTagTimestamps.get(code) || 0;
   // Re-verify from Firestore on cold start (lastHydrated === 0) or every 30s when public scanners poll
-  if (lastHydrated > 0 && now - lastHydrated < 30_000) {
-    return;
+  if (!forceLookup && lastHydrated > 0 && now - lastHydrated < 30_000) {
+    return true;
   }
   if (!firebaseConfig.projectId || !firebaseConfig.firestoreDatabaseId) {
-    return;
+    return false;
   }
 
   hydratedTagTimestamps.set(code, now);
@@ -137,43 +318,87 @@ async function hydrateTagFromFirestoreIfNeeded(store: StoreSchema, tag: TagConfi
 
   try {
     const tagUrl = `${baseUrl}/tags/${encodeURIComponent(code)}${keyParam}`;
-    const vaultId = computeVaultId(code);
-    const vaultUrl = `${baseUrl}/tags/${encodeURIComponent(code)}/vault/${encodeURIComponent(vaultId)}${keyParam}`;
+    const primaryVaultId = computeVaultId(code, PRIMARY_VAULT_KEY);
+    const stableVaultId = computeVaultId(code, STABLE_VAULT_KEY);
+    const legacyVaultId = computeVaultId(code, LEGACY_VAULT_KEY);
+    const vaultUrl = `${baseUrl}/tags/${encodeURIComponent(code)}/vault/${encodeURIComponent(primaryVaultId)}${keyParam}`;
 
-    const [tagRes, vaultRes] = await Promise.all([
+    const [tagRes, primaryVaultRes] = await Promise.all([
       fetch(tagUrl, { signal: AbortSignal.timeout(3500) }).catch(() => null),
       fetch(vaultUrl, { signal: AbortSignal.timeout(3500) }).catch(() => null),
     ]);
 
-    let mutated = false;
-
-    if (tagRes && tagRes.ok) {
-      const docJson = (await tagRes.json()) as {
-        fields?: Record<string, { stringValue?: string; booleanValue?: boolean; integerValue?: string; doubleValue?: number }>;
-      };
-      const f = docJson.fields;
-      if (f) {
-        if (f.ownerId?.stringValue) tag.ownerUid = f.ownerId.stringValue;
-        if (typeof f.vehicleLabel?.stringValue === 'string') tag.vehicleLabel = f.vehicleLabel.stringValue;
-        if (typeof f.plateNumber?.stringValue === 'string') tag.plateHint = f.plateNumber.stringValue;
-        if (typeof f.contactEnabled?.booleanValue === 'boolean') {
-          tag.contactEnabled = f.contactEnabled.booleanValue;
-        }
-        const rawExpire =
-          typeof f.autoExpireAt?.integerValue === 'string'
-            ? Number(f.autoExpireAt.integerValue)
-            : typeof f.autoExpireAt?.doubleValue === 'number'
-            ? f.autoExpireAt.doubleValue
-            : 0;
-        tag.autoExpireAt = rawExpire > 0 ? rawExpire : null;
-        if (typeof f.statusNote?.stringValue === 'string') {
-          tag.statusNote = f.statusNote.stringValue;
-        }
-        mutated = true;
-      }
+    if (!tagRes || !tagRes.ok) {
+      return false;
     }
 
-    if (vaultRes && vaultRes.ok) {
+    let vaultRes = primaryVaultRes;
+    if ((!vaultRes || !vaultRes.ok) && stableVaultId !== primaryVaultId) {
+      const stableUrl = `${baseUrl}/tags/${encodeURIComponent(code)}/vault/${encodeURIComponent(stableVaultId)}${keyParam}`;
+      vaultRes = await fetch(stableUrl, { signal: AbortSignal.timeout(2500) }).catch(() => null);
+    }
+    if ((!vaultRes || !vaultRes.ok) && legacyVaultId !== primaryVaultId && legacyVaultId !== stableVaultId) {
+      const legacyUrl = `${baseUrl}/tags/${encodeURIComponent(code)}/vault/${encodeURIComponent(legacyVaultId)}${keyParam}`;
+      vaultRes = await fetch(legacyUrl, { signal: AbortSignal.timeout(2500) }).catch(() => null);
+    }
+
+    const docJson = (await tagRes.json()) as {
+      updateTime?: string;
+      fields?: Record<
+        string,
+        {
+          stringValue?: string;
+          booleanValue?: boolean;
+          integerValue?: string;
+          doubleValue?: number;
+          timestampValue?: string;
+        }
+      >;
+    };
+    const f = docJson.fields;
+    if (!f) {
+      return false;
+    }
+
+    const fsUpdatedIso = f.updatedAt?.timestampValue || docJson.updateTime || '';
+    const fsUpdatedMs = fsUpdatedIso ? Date.parse(fsUpdatedIso) : 0;
+    const lastLocalMutation = lastLocalMutationMap.get(code) || 0;
+    // Apply Firestore tag fields if no local mutation has occurred in this server process yet, or if Firestore has a newer timestamp
+    const shouldApplyTagDoc =
+      forceLookup ||
+      lastLocalMutation === 0 ||
+      (Number.isFinite(fsUpdatedMs) && fsUpdatedMs > lastLocalMutation + 2000);
+
+    let mutated = false;
+
+    if (shouldApplyTagDoc) {
+      if (f.ownerId?.stringValue) tag.ownerUid = f.ownerId.stringValue;
+      const normalized = normalizePersistedTagFields({
+        code,
+        vehicleLabel: f.vehicleLabel?.stringValue,
+        plateNumber: f.plateNumber?.stringValue,
+        statusNote: f.statusNote?.stringValue,
+      });
+      tag.vehicleLabel = normalized.vehicleLabel;
+      tag.plateHint = normalized.plateHint;
+      tag.statusNote = normalized.statusNote;
+      if (typeof f.contactEnabled?.booleanValue === 'boolean') {
+        tag.contactEnabled = f.contactEnabled.booleanValue;
+      }
+      const rawExpire =
+        typeof f.autoExpireAt?.integerValue === 'string'
+          ? Number(f.autoExpireAt.integerValue)
+          : typeof f.autoExpireAt?.doubleValue === 'number'
+          ? f.autoExpireAt.doubleValue
+          : 0;
+      tag.autoExpireAt = rawExpire > 0 ? rawExpire : null;
+      if (Number.isFinite(fsUpdatedMs) && fsUpdatedMs > 0) {
+        tag.updatedAt = fsUpdatedMs;
+      }
+      mutated = true;
+    }
+
+    if (vaultRes && vaultRes.ok && (shouldApplyTagDoc || !tag.telegramBotToken || !tag.ownerPinHash)) {
       const vaultJson = (await vaultRes.json()) as {
         fields?: Record<string, { stringValue?: string }>;
       };
@@ -184,22 +409,78 @@ async function hydrateTagFromFirestoreIfNeeded(store: StoreSchema, tag: TagConfi
           tag.telegramEnabled = decrypted.telegramEnabled;
           tag.telegramBotToken = decrypted.telegramBotToken;
           tag.telegramChatId = decrypted.telegramChatId;
+          if (decrypted.ownerPinHash !== undefined) {
+            tag.ownerPinHash = decrypted.ownerPinHash;
+          }
+          if (decrypted.ownerEmail) {
+            tag.ownerEmail = decrypted.ownerEmail;
+          }
           mutated = true;
         }
       }
     }
 
     if (mutated) {
-      if (!hasTagSetupData(tag)) {
-        tag.contactEnabled = false;
-        tag.autoExpireAt = null;
-      }
       cleanupStoreState(store, Date.now());
       saveStore(store);
     }
+    return true;
   } catch {
-    // Non-fatal: continue with local store state
+    return false;
   }
+}
+
+async function findOrHydrateTagByCode(
+  store: StoreSchema,
+  rawCode: string,
+  now: number
+): Promise<TagConfig | null> {
+  const code = (rawCode || '').trim().toUpperCase();
+  if (!/^[A-Z0-9-]{4,20}$/.test(code)) {
+    return null;
+  }
+
+  const existing = store.tags.find((t) => t.code.toUpperCase() === code);
+  if (existing) {
+    await hydrateTagFromFirestoreIfNeeded(store, existing);
+    return existing;
+  }
+
+  // Check negative lookup cache for unknown or rotated codes not yet in memory
+  const lastMiss = missingTagLookupCache.get(code) || 0;
+  if (lastMiss > 0 && now - lastMiss < 30_000) {
+    return null;
+  }
+
+  const candidateTag: TagConfig = {
+    ...createInitialTagConfig(now),
+    id: store.tags[0]?.id || 'tag-default',
+    code,
+  };
+
+  const foundInFirestore = await hydrateTagFromFirestoreIfNeeded(store, candidateTag, true);
+  if (!foundInFirestore) {
+    pruneBoundedTimestampMap(missingTagLookupCache, now, 30_000);
+    missingTagLookupCache.set(code, now);
+    return null;
+  }
+
+  missingTagLookupCache.delete(code);
+  const primary = store.tags[0];
+  if (
+    primary &&
+    ((!hasTagSetupData(primary) && !primary.ownerUid && !lastLocalMutationMap.has(primary.code.toUpperCase())) ||
+      (primary.ownerUid && candidateTag.ownerUid && primary.ownerUid === candidateTag.ownerUid))
+  ) {
+    Object.assign(primary, candidateTag, { id: primary.id });
+    saveStore(store);
+    return primary;
+  }
+
+  candidateTag.id = `tag-${code.toLowerCase()}`;
+  store.tags.push(candidateTag);
+  saveStore(store);
+  return candidateTag;
 }
 
 function getInitialStore(): StoreSchema {
@@ -287,6 +568,83 @@ function extractFirebaseUid(req: Request): string | null {
     return headerUid.trim();
   }
   return null;
+}
+
+function extractFirebaseEmail(req: Request): string | null {
+  const headerEmail = req.headers['x-firebase-email'];
+  if (typeof headerEmail === 'string' && headerEmail.trim().length <= 120) {
+    return headerEmail.trim().toLowerCase();
+  }
+  return null;
+}
+
+interface VerifiedFirebaseIdentity {
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+  expiresAtMs: number;
+}
+
+const verifiedIdTokenCache = new Map<string, VerifiedFirebaseIdentity>();
+
+async function verifyFirebaseBearerTokenIfPresent(
+  req: Request,
+  now: number
+): Promise<VerifiedFirebaseIdentity | null> {
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader !== 'string' || !authHeader.startsWith('Bearer ')) {
+    return null;
+  }
+  const idToken = authHeader.slice('Bearer '.length).trim();
+  if (!idToken || idToken.length < 32) {
+    return null;
+  }
+
+  const cached = verifiedIdTokenCache.get(idToken);
+  if (cached && cached.expiresAtMs > now) {
+    return cached;
+  }
+
+  if (!firebaseConfig.apiKey) {
+    return null;
+  }
+
+  try {
+    const lookupUrl = `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(
+      firebaseConfig.apiKey
+    )}`;
+    const res = await fetch(lookupUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken }),
+      signal: AbortSignal.timeout(3500),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      users?: Array<{
+        localId?: string;
+        email?: string;
+        emailVerified?: boolean;
+      }>;
+    };
+    const user = data.users?.[0];
+    if (!user?.localId || !user?.email) return null;
+
+    const identity: VerifiedFirebaseIdentity = {
+      uid: user.localId.trim(),
+      email: user.email.trim().toLowerCase(),
+      emailVerified: Boolean(user.emailVerified),
+      expiresAtMs: now + 5 * 60 * 1000,
+    };
+
+    if (verifiedIdTokenCache.size > 200) {
+      verifiedIdTokenCache.clear();
+    }
+    verifiedIdTokenCache.set(idToken, identity);
+    return identity;
+  } catch {
+    return null;
+  }
 }
 
 async function sendTelegramMessageWithRetry(
@@ -425,7 +783,8 @@ function applyParsedTelegramUpdate(
     tag.contactEnabled = false;
     tag.autoExpireAt = null;
     tag.updatedAt = now;
-    hydratedTagTimestamps.set(tag.code.toUpperCase(), now + 3600_000);
+    lastLocalMutationMap.set(tag.code.toUpperCase(), now);
+    hydratedTagTimestamps.set(tag.code.toUpperCase(), now);
     saveStore(store);
     return { applied: true, dndChanged: true };
   }
@@ -434,7 +793,8 @@ function applyParsedTelegramUpdate(
     tag.contactEnabled = true;
     tag.autoExpireAt = null;
     tag.updatedAt = now;
-    hydratedTagTimestamps.set(tag.code.toUpperCase(), now + 3600_000);
+    lastLocalMutationMap.set(tag.code.toUpperCase(), now);
+    hydratedTagTimestamps.set(tag.code.toUpperCase(), now);
     saveStore(store);
     return { applied: true, dndChanged: true };
   }
@@ -474,6 +834,7 @@ async function syncTelegramBotRepliesIfNeeded(
 
     let appliedCount = 0;
     let maxUpdateUpdated = false;
+    const vehicleDisplay = tag.plateHint || tag.vehicleLabel || tag.code;
     for (const upd of data.result) {
       const prevMax = tag.lastTelegramUpdateId || 0;
       const outcome = applyParsedTelegramUpdate(store, tag, upd, Date.now());
@@ -486,15 +847,15 @@ async function syncTelegramBotRepliesIfNeeded(
           void sendTelegramMessageWithRetry(
             tag.telegramBotToken,
             tag.telegramChatId,
-            `✓ Reply delivered to scanner on ${tag.plateHint}: "${outcome.replyMessage.text}"`
+            `✓ Reply delivered to scanner on ${vehicleDisplay}: "${outcome.replyMessage.text}"`
           );
         } else if (outcome.dndChanged) {
           void sendTelegramMessageWithRetry(
             tag.telegramBotToken,
             tag.telegramChatId,
             tag.contactEnabled
-              ? `🟢 ${tag.plateHint} is now Reachable (ON).`
-              : `🔒 ${tag.plateHint} switched to Do Not Disturb (OFF). Incoming QR scans are now paused.`
+              ? `🟢 ${vehicleDisplay} is now Reachable (ON).`
+              : `🔒 ${vehicleDisplay} switched to Do Not Disturb (OFF). Incoming QR scans are now paused.`
           );
         }
       }
@@ -507,6 +868,12 @@ async function syncTelegramBotRepliesIfNeeded(
     return 0;
   }
 }
+
+const asyncHandler =
+  (fn: (req: Request, res: Response, next: NextFunction) => Promise<void>) =>
+  (req: Request, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
 
 async function startServer() {
   const app = express();
@@ -537,63 +904,222 @@ async function startServer() {
     res.status(200).json(computeHealthSummary(store, now, SERVER_STARTED_AT));
   });
 
-  // Bootstrap or verify an authenticated owner session (HttpOnly cookie + token header)
-  app.post('/api/owner/session', (req, res) => {
-    const store = getCleanedStore(Date.now());
-    if (!Array.isArray(store.ownerTokens)) {
-      store.ownerTokens = [];
-    }
-
-    const existingToken = extractOwnerToken(req);
-    const firebaseUid = extractFirebaseUid(req);
-    const primaryTag = store.tags[0];
-
-    // If tag is already claimed by a specific Firebase UID and caller provides a different UID, deny
-    if (primaryTag?.ownerUid && firebaseUid && primaryTag.ownerUid !== firebaseUid) {
-      res.status(403).json({
-        error: 'Forbidden: This vehicle tag is registered to a different account.',
-      });
-      return;
-    }
-
-    let token =
-      existingToken && store.ownerTokens.includes(existingToken)
-        ? existingToken
-        : `rt_own_${crypto.randomBytes(24).toString('hex')}`;
-
-    if (!store.ownerTokens.includes(token)) {
-      store.ownerTokens.push(token);
-      if (store.ownerTokens.length > 25) {
-        store.ownerTokens = store.ownerTokens.slice(-25);
+  // Check current owner session & security gate configuration (safe for unauthenticated gate display)
+  app.get(
+    '/api/owner/auth-status',
+    asyncHandler(async (req, res) => {
+      const now = Date.now();
+      const store = getCleanedStore(now);
+      const primaryTag = store.tags[0];
+      if (primaryTag) {
+        await hydrateTagFromFirestoreIfNeeded(store, primaryTag);
       }
+
+      const validTokens = getActiveValidOwnerTokens(store, now, primaryTag?.ownerPinHash);
+      const providedToken = extractOwnerToken(req);
+      const providedFirebaseUid = extractFirebaseUid(req);
+      const providedOwnerEmail = extractFirebaseEmail(req);
+
+      const check = verifyOwnerAccess({
+        providedToken,
+        validTokens,
+        tagOwnerUid: primaryTag?.ownerUid,
+        providedFirebaseUid,
+        providedOwnerEmail,
+        allowedOwnerEmail: primaryTag?.ownerEmail || AUTHORIZED_OWNER_EMAIL,
+      });
+
+      res.json({
+        authenticated: check.authorized,
+        pinConfigured: Boolean(primaryTag?.ownerPinHash),
+        authorizedEmail: primaryTag?.ownerEmail || AUTHORIZED_OWNER_EMAIL,
+        serverTime: now,
+      });
+    })
+  );
+
+  // Bootstrap or verify an authenticated owner session (requires cryptographically verified Google owner token or Owner Security PIN)
+  app.post(
+    '/api/owner/session',
+    asyncHandler(async (req, res) => {
+      if (!verifySameOriginRequest(req.headers.origin, req.get('host'))) {
+        res.status(403).json({ error: 'Forbidden: Cross-origin session request rejected.' });
+        return;
+      }
+
+      const now = Date.now();
+      const store = getCleanedStore(now);
+      if (!Array.isArray(store.ownerTokens)) {
+        store.ownerTokens = [];
+      }
+
+      const primaryTag = store.tags[0];
+      if (primaryTag) {
+        await hydrateTagFromFirestoreIfNeeded(store, primaryTag);
+      }
+
+      const clientIp = extractClientIp(
+        req.headers['x-forwarded-for'],
+        req.ip || req.socket.remoteAddress
+      );
+
+      // Global per-IP rate limit on session creation attempts (prevents token/PIN brute-forcing)
+      const sessionRateCheck = checkScannerRateLimit(
+        scannerRateLimitMap,
+        `owner-session:${clientIp}`,
+        now,
+        15,
+        60_000
+      );
+      if (!sessionRateCheck.allowed) {
+        res.status(429).json({
+          error: `Too many authentication attempts. Please wait ${sessionRateCheck.retryAfterSeconds}s before trying again.`,
+          retryAfterSeconds: sessionRateCheck.retryAfterSeconds,
+        });
+        return;
+      }
+
+      const verifiedBearer = await verifyFirebaseBearerTokenIfPresent(req, now);
+      const existingToken = extractOwnerToken(req);
+      const rawHeaderUid = extractFirebaseUid(req);
+      const rawHeaderEmail = extractFirebaseEmail(req);
+
+      // CRITICAL ZERO-TRUST INVARIANT: Never fall back to unverified X-Firebase-Uid / X-Firebase-Email headers
+      const firebaseUid = verifiedBearer ? verifiedBearer.uid : null;
+      const firebaseEmail = verifiedBearer ? verifiedBearer.email : null;
+      const unverifiedHeaderPresent = Boolean(!verifiedBearer && (rawHeaderUid || rawHeaderEmail));
+
+      const rawPin = (req.body as { pin?: unknown } | undefined)?.pin;
+      const pinAttemptProvided = typeof rawPin === 'string' && rawPin.trim().length > 0;
+
+      // Strict rate-limit on PIN attempts per IP (5 attempts per 60s)
+      if (pinAttemptProvided) {
+        const pinRateCheck = checkScannerRateLimit(
+          scannerRateLimitMap,
+          `owner-pin:${clientIp}`,
+          now,
+          5,
+          60_000
+        );
+        if (!pinRateCheck.allowed) {
+          res.status(429).json({
+            error: `Too many PIN attempts. Please wait ${pinRateCheck.retryAfterSeconds}s before trying again.`,
+            retryAfterSeconds: pinRateCheck.retryAfterSeconds,
+          });
+          return;
+        }
+      }
+
+      const pinVerified = pinAttemptProvided
+        ? verifyOwnerPinHash(rawPin, primaryTag?.ownerPinHash)
+        : false;
+
+      const validTokens = getActiveValidOwnerTokens(store, now, primaryTag?.ownerPinHash);
+
+      const evalResult = evaluateOwnerSessionRequest({
+        existingToken,
+        validTokens,
+        firebaseUid,
+        firebaseEmail,
+        firebaseTokenVerified: Boolean(verifiedBearer),
+        firebaseEmailVerified: verifiedBearer?.emailVerified ?? false,
+        unverifiedHeaderPresent,
+        tagOwnerUid: primaryTag?.ownerUid,
+        allowedOwnerEmail: primaryTag?.ownerEmail || AUTHORIZED_OWNER_EMAIL,
+        pinVerified,
+        pinAttemptProvided,
+      });
+
+      if (!evalResult.allowed) {
+        res.status(evalResult.status).json({
+          error: evalResult.error,
+          pinConfigured: Boolean(primaryTag?.ownerPinHash),
+        });
+        return;
+      }
+
+      const token =
+        existingToken && validTokens.has(existingToken)
+          ? existingToken
+          : mintSignedOwnerToken(now, primaryTag?.ownerPinHash);
+
+      if (!store.ownerTokens.includes(token)) {
+        store.ownerTokens.push(token);
+        if (store.ownerTokens.length > 25) {
+          store.ownerTokens = store.ownerTokens.slice(-25);
+        }
+      }
+
+      // Bind tag ownerUid & ownerEmail ONLY when cryptographically verified Google owner signs in
+      if (
+        primaryTag &&
+        verifiedBearer &&
+        verifiedBearer.emailVerified &&
+        isAuthorizedOwnerEmail(verifiedBearer.email, primaryTag.ownerEmail || AUTHORIZED_OWNER_EMAIL)
+      ) {
+        if (!primaryTag.ownerUid) {
+          primaryTag.ownerUid = verifiedBearer.uid;
+        }
+        primaryTag.ownerEmail = verifiedBearer.email || AUTHORIZED_OWNER_EMAIL;
+      }
+
+      saveStore(store);
+
+      const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+      const isSecureReq = Boolean(req.secure || forwardedProto === 'https');
+      res.setHeader('Set-Cookie', buildOwnerSessionCookie(token, isSecureReq));
+      res.json({
+        token,
+        authMethod: evalResult.authMethod,
+        pinConfigured: Boolean(primaryTag?.ownerPinHash),
+        serverTime: now,
+      });
+    })
+  );
+
+  // Revoke active owner session token & lock console immediately
+  app.post('/api/owner/logout', (req, res) => {
+    const now = Date.now();
+    const store = getCleanedStore(now);
+    const existingToken = extractOwnerToken(req);
+    if (existingToken && Array.isArray(store.ownerTokens)) {
+      store.ownerTokens = store.ownerTokens.filter((t) => t !== existingToken);
+      saveStore(store);
     }
-
-    // Bind tag ownerUid when owner signs in with Firebase
-    if (primaryTag && firebaseUid && !primaryTag.ownerUid) {
-      primaryTag.ownerUid = firebaseUid;
-    }
-
-    saveStore(store);
-
     const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
     const isSecureReq = Boolean(req.secure || forwardedProto === 'https');
-    res.setHeader('Set-Cookie', buildOwnerSessionCookie(token, isSecureReq));
-    res.json({ token, serverTime: Date.now() });
+    const sameSitePart = isSecureReq ? 'SameSite=None; Secure' : 'SameSite=Lax';
+    res.setHeader(
+      'Set-Cookie',
+      `relaytag_owner_token=; Path=/; HttpOnly; ${sameSitePart}; Max-Age=0`
+    );
+    res.json({ ok: true, serverTime: now });
   });
 
   // Guard middleware for all /api/owner/* endpoints
   const requireOwnerAuth = (req: Request, res: Response, next: NextFunction) => {
-    const store = getCleanedStore(Date.now());
-    const validTokens = new Set(store.ownerTokens || []);
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      if (!verifySameOriginRequest(req.headers.origin, req.get('host'))) {
+        res.status(403).json({ error: 'Forbidden: Cross-origin mutation rejected.' });
+        return;
+      }
+    }
+
+    const now = Date.now();
+    const store = getCleanedStore(now);
+    const primaryTag = store.tags[0];
+    const validTokens = getActiveValidOwnerTokens(store, now, primaryTag?.ownerPinHash);
     const providedToken = extractOwnerToken(req);
     const providedFirebaseUid = extractFirebaseUid(req);
-    const primaryTag = store.tags[0];
+    const providedOwnerEmail = extractFirebaseEmail(req);
 
     const check = verifyOwnerAccess({
       providedToken,
       validTokens,
       tagOwnerUid: primaryTag?.ownerUid,
       providedFirebaseUid,
+      providedOwnerEmail,
+      allowedOwnerEmail: primaryTag?.ownerEmail || AUTHORIZED_OWNER_EMAIL,
     });
 
     if (!check.authorized) {
@@ -601,28 +1127,93 @@ async function startServer() {
       return;
     }
 
-    if (primaryTag && providedFirebaseUid && !primaryTag.ownerUid) {
-      primaryTag.ownerUid = providedFirebaseUid;
-      saveStore(store);
-    }
-
     next();
   };
 
-  app.get('/api/owner/state', requireOwnerAuth, async (_req, res) => {
+  // Set, update, or remove the 4-8 digit Owner Security PIN (rotates session tokens to revoke prior PIN sessions)
+  app.post('/api/owner/tags/:id/security-pin', requireOwnerAuth, (req, res) => {
     const now = Date.now();
     const store = getCleanedStore(now);
-    const primaryTag = store.tags[0];
-    if (primaryTag && primaryTag.telegramEnabled) {
-      await syncTelegramBotRepliesIfNeeded(store, primaryTag, now);
+    const tag = store.tags.find((t) => t.id === req.params.id);
+    if (!tag) {
+      res.status(404).json({ error: 'Tag not found' });
+      return;
     }
 
+    const { pin, remove } = (req.body || {}) as { pin?: unknown; remove?: unknown };
+
+    // Allow clearing PIN if remove === true, null, or empty string is passed
+    if (remove === true || pin === null || (typeof pin === 'string' && pin.trim() === '')) {
+      tag.ownerPinHash = null;
+      tag.updatedAt = now;
+      // Revoke all old session tokens and issue a fresh token bound to the updated PIN state
+      const rotatedToken = mintSignedOwnerToken(now, null);
+      store.ownerTokens = [rotatedToken];
+      lastLocalMutationMap.set(tag.code.toUpperCase(), now);
+      hydratedTagTimestamps.set(tag.code.toUpperCase(), now);
+      saveStore(store);
+      const vault = buildVaultForTag(tag);
+      const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+      const isSecureReq = Boolean(req.secure || forwardedProto === 'https');
+      res.setHeader('Set-Cookie', buildOwnerSessionCookie(rotatedToken, isSecureReq));
+      res.json({
+        ok: true,
+        pinConfigured: false,
+        token: rotatedToken,
+        tag: toOwnerTagView(tag),
+        vault,
+        serverTime: now,
+      });
+      return;
+    }
+
+    const pinCheck = validateOwnerPinFormat(pin);
+    if (!pinCheck.valid) {
+      res.status(400).json({ error: pinCheck.error });
+      return;
+    }
+
+    tag.ownerPinHash = hashOwnerPin(pinCheck.cleanPin);
+    tag.updatedAt = now;
+    // Rotate session tokens so any previous sessions unlocked with an older PIN are revoked immediately
+    const rotatedToken = mintSignedOwnerToken(now, tag.ownerPinHash);
+    store.ownerTokens = [rotatedToken];
+    lastLocalMutationMap.set(tag.code.toUpperCase(), now);
+    hydratedTagTimestamps.set(tag.code.toUpperCase(), now);
+    saveStore(store);
+
+    const vault = buildVaultForTag(tag);
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+    const isSecureReq = Boolean(req.secure || forwardedProto === 'https');
+    res.setHeader('Set-Cookie', buildOwnerSessionCookie(rotatedToken, isSecureReq));
     res.json({
-      tags: store.tags.map((t) => toOwnerTagView(t)),
-      messages: [...store.messages].sort((a, b) => a.createdAt - b.createdAt),
+      ok: true,
+      pinConfigured: true,
+      token: rotatedToken,
+      tag: toOwnerTagView(tag),
+      vault,
       serverTime: now,
     });
   });
+
+  app.get(
+    '/api/owner/state',
+    requireOwnerAuth,
+    asyncHandler(async (_req, res) => {
+      const now = Date.now();
+      const store = getCleanedStore(now);
+      const primaryTag = store.tags[0];
+      if (primaryTag && primaryTag.telegramEnabled) {
+        await syncTelegramBotRepliesIfNeeded(store, primaryTag, now);
+      }
+
+      res.json({
+        tags: store.tags.map((t) => toOwnerTagView(t)),
+        messages: [...store.messages].sort((a, b) => a.createdAt - b.createdAt),
+        serverTime: now,
+      });
+    })
+  );
 
   app.patch('/api/owner/tags/:id/toggle', requireOwnerAuth, (req, res) => {
     const now = Date.now();
@@ -647,6 +1238,7 @@ async function startServer() {
       tag.autoExpireAt = null;
     }
     tag.updatedAt = now;
+    lastLocalMutationMap.set(tag.code.toUpperCase(), now);
     hydratedTagTimestamps.set(tag.code.toUpperCase(), now);
 
     saveStore(store);
@@ -663,6 +1255,7 @@ async function startServer() {
     }
 
     const {
+      code,
       vehicleLabel,
       plateHint,
       statusNote,
@@ -673,14 +1266,20 @@ async function startServer() {
       telegramChatId,
     } = req.body as Partial<TagConfig>;
 
+    if (typeof code === 'string' && /^[A-Z0-9-]{4,20}$/.test(code.trim().toUpperCase())) {
+      tag.code = code.trim().toUpperCase();
+    }
     if (typeof vehicleLabel === 'string') {
-      tag.vehicleLabel = vehicleLabel.trim().slice(0, 60);
+      const normalized = normalizePersistedTagFields({ code: tag.code, vehicleLabel });
+      tag.vehicleLabel = normalized.vehicleLabel;
     }
     if (typeof plateHint === 'string') {
-      tag.plateHint = plateHint.trim().toUpperCase().slice(0, 20);
+      const normalized = normalizePersistedTagFields({ code: tag.code, plateHint });
+      tag.plateHint = normalized.plateHint;
     }
     if (typeof statusNote === 'string') {
-      tag.statusNote = statusNote.trim().slice(0, 160);
+      const normalized = normalizePersistedTagFields({ code: tag.code, statusNote });
+      tag.statusNote = normalized.statusNote;
     }
     if (typeof contactEnabled === 'boolean') {
       tag.contactEnabled = contactEnabled;
@@ -719,21 +1318,16 @@ async function startServer() {
     tag.telegramBotToken = nextBotToken;
     tag.telegramChatId = nextChatId;
     tag.updatedAt = now;
+    lastLocalMutationMap.set(tag.code.toUpperCase(), now);
     hydratedTagTimestamps.set(tag.code.toUpperCase(), now);
+    missingTagLookupCache.delete(tag.code.toUpperCase());
 
     saveStore(store);
-    const vault = {
-      vaultId: computeVaultId(tag.code),
-      ciphertext: encryptRelayVault({
-        telegramEnabled: tag.telegramEnabled,
-        telegramBotToken: tag.telegramBotToken,
-        telegramChatId: tag.telegramChatId,
-      }),
-    };
+    const vault = buildVaultForTag(tag);
     res.json({ tag: toOwnerTagView(tag), vault, serverTime: now });
   });
 
-  app.post('/api/owner/tags/:id/test-telegram', requireOwnerAuth, async (req, res) => {
+  app.post('/api/owner/tags/:id/regenerate-code', requireOwnerAuth, (req, res) => {
     const now = Date.now();
     const store = getCleanedStore(now);
     const tag = store.tags.find((t) => t.id === req.params.id);
@@ -742,155 +1336,234 @@ async function startServer() {
       return;
     }
 
-    const { telegramBotToken, telegramChatId } = (req.body || {}) as {
-      telegramBotToken?: unknown;
-      telegramChatId?: unknown;
-    };
-
-    const candidateToken =
-      typeof telegramBotToken === 'string'
-        ? resolveUpdatedBotToken(telegramBotToken, tag.telegramBotToken)
-        : tag.telegramBotToken;
-    const candidateChatId =
-      typeof telegramChatId === 'string'
-        ? telegramChatId.trim().slice(0, 60)
-        : tag.telegramChatId;
-
-    const validation = validateTelegramCredentials(candidateToken, candidateChatId);
-    if (!validation.valid) {
-      res.status(400).json({ ok: false, error: validation.error });
-      return;
+    const previousCode = tag.code;
+    const previousVaultId = computeVaultId(previousCode);
+    const existingCodes = new Set(store.tags.map((t) => t.code.toUpperCase()));
+    let nextCode = generateNewTagCode(previousCode);
+    for (let i = 0; i < 10 && existingCodes.has(nextCode); i++) {
+      nextCode = generateNewTagCode(previousCode);
     }
 
-    // Clear any stale webhook so 2-way getUpdates polling works reliably
-    try {
-      await fetch(
-        `https://api.telegram.org/bot${validation.cleanBotToken}/deleteWebhook`,
-        { method: 'POST', signal: AbortSignal.timeout(3000) }
-      );
-    } catch {
-      // non-fatal
-    }
+    hydratedTagTimestamps.delete(previousCode.toUpperCase());
+    lastLocalMutationMap.delete(previousCode.toUpperCase());
+    lastTelegramPollMap.delete(previousCode.toUpperCase());
+    missingTagLookupCache.set(previousCode.toUpperCase(), now);
+    missingTagLookupCache.delete(nextCode.toUpperCase());
 
-    const testPayload = [
-      `✅ RelayTag 2-Way Connected — ${tag.vehicleLabel} (${tag.plateHint})`,
-      `Tag ID: ${tag.code}`,
-      `Status: Instant Telegram alerts & direct 2-way replies are active!`,
-      `↩️ Reply directly to any scan alert in Telegram to message the scanner back, or send /dnd here anytime to turn off alerts.`,
-    ].join('\n');
-
-    const result = await sendTelegramMessageWithRetry(
-      validation.cleanBotToken,
-      validation.cleanChatId,
-      testPayload
-    );
-
-    if (!result.forwarded) {
-      res.status(400).json({
-        ok: false,
-        error: result.error || 'Could not deliver test message to Telegram.',
-      });
-      return;
-    }
-
-    // Automatically save and enable the verified credentials
-    tag.telegramEnabled = true;
-    tag.telegramBotToken = validation.cleanBotToken;
-    tag.telegramChatId = validation.cleanChatId;
+    tag.code = nextCode;
     tag.updatedAt = now;
-    hydratedTagTimestamps.set(tag.code.toUpperCase(), now);
+    lastLocalMutationMap.set(nextCode.toUpperCase(), now);
+    hydratedTagTimestamps.set(nextCode.toUpperCase(), now);
+
+    // Clear messages from the revoked QR code so the rotated tag starts clean
+    store.messages = store.messages.filter((m) => m.tagId !== tag.id);
     saveStore(store);
 
-    const vault = {
-      vaultId: computeVaultId(tag.code),
-      ciphertext: encryptRelayVault({
-        telegramEnabled: tag.telegramEnabled,
-        telegramBotToken: tag.telegramBotToken,
-        telegramChatId: tag.telegramChatId,
-      }),
-    };
+    const vault = buildVaultForTag(tag);
 
     res.json({
       ok: true,
+      previousCode,
+      previousVaultId,
       tag: toOwnerTagView(tag),
       vault,
       serverTime: now,
     });
   });
 
-  app.post('/api/owner/tags/:id/simulate-telegram-reply', requireOwnerAuth, async (req, res) => {
-    const now = Date.now();
-    const store = getCleanedStore(now);
-    const tag = store.tags.find((t) => t.id === req.params.id);
-    if (!tag) {
-      res.status(404).json({ error: 'Tag not found' });
-      return;
-    }
-
-    // First pull any real pending replies from Telegram if configured
-    await syncTelegramBotRepliesIfNeeded(store, tag, now, true);
-
-    const { text, sessionId } = (req.body || {}) as {
-      text?: unknown;
-      sessionId?: unknown;
-    };
-    const replyText =
-      typeof text === 'string' && text.trim()
-        ? text.trim()
-        : 'On my way down right now — thanks for scanning! (Sent directly from Telegram)';
-
-    const simulatedUpdateId = Math.max((tag.lastTelegramUpdateId || 1000) + 1, now);
-    const simulatedChatId = tag.telegramChatId.trim() || '999999999';
-    const targetSession = resolveTargetScannerSession(store.messages, tag.id, sessionId);
-
-    const fakeUpdate: TelegramIncomingUpdate = {
-      update_id: simulatedUpdateId,
-      message: {
-        text: replyText,
-        chat: { id: simulatedChatId },
-        from: { is_bot: false },
-        reply_to_message: targetSession
-          ? { text: `Session: #${targetSession}` }
-          : undefined,
-      },
-    };
-
-    const prevChatId = tag.telegramChatId;
-    tag.telegramChatId = simulatedChatId;
-    const outcome = applyParsedTelegramUpdate(store, tag, fakeUpdate, now);
-    tag.telegramChatId = prevChatId;
-    saveStore(store);
-
-    res.status(201).json({
-      ok: outcome.applied,
-      message: outcome.replyMessage,
-      serverTime: now,
-    });
-  });
-
-  app.post('/api/telegram/webhook/:code', (req, res) => {
-    const now = Date.now();
-    const store = getCleanedStore(now);
-    const code = (req.params.code || '').trim().toUpperCase();
-    const tag = store.tags.find((t) => t.code.toUpperCase() === code);
-    if (!tag || !tag.telegramEnabled) {
-      res.status(200).json({ ok: true });
-      return;
-    }
-
-    const update = req.body as TelegramIncomingUpdate;
-    if (update && typeof update.update_id === 'number') {
-      const outcome = applyParsedTelegramUpdate(store, tag, update, now);
-      if (outcome.applied && outcome.replyMessage && tag.telegramBotToken && tag.telegramChatId) {
-        void sendTelegramMessageWithRetry(
-          tag.telegramBotToken,
-          tag.telegramChatId,
-          `✓ Reply delivered to scanner on ${tag.plateHint}: "${outcome.replyMessage.text}"`
-        );
+  app.post(
+    '/api/owner/tags/:id/test-telegram',
+    requireOwnerAuth,
+    asyncHandler(async (req, res) => {
+      const now = Date.now();
+      const store = getCleanedStore(now);
+      const tag = store.tags.find((t) => t.id === req.params.id);
+      if (!tag) {
+        res.status(404).json({ error: 'Tag not found' });
+        return;
       }
-    }
-    res.status(200).json({ ok: true });
-  });
+
+      const { telegramBotToken, telegramChatId } = (req.body || {}) as {
+        telegramBotToken?: unknown;
+        telegramChatId?: unknown;
+      };
+
+      const candidateToken =
+        typeof telegramBotToken === 'string'
+          ? resolveUpdatedBotToken(telegramBotToken, tag.telegramBotToken)
+          : tag.telegramBotToken;
+      const candidateChatId =
+        typeof telegramChatId === 'string'
+          ? telegramChatId.trim().slice(0, 60)
+          : tag.telegramChatId;
+
+      const validation = validateTelegramCredentials(candidateToken, candidateChatId);
+      if (!validation.valid) {
+        res.status(400).json({ ok: false, error: validation.error });
+        return;
+      }
+
+      // Clear any stale webhook so 2-way getUpdates polling works reliably
+      try {
+        await fetch(
+          `https://api.telegram.org/bot${validation.cleanBotToken}/deleteWebhook`,
+          { method: 'POST', signal: AbortSignal.timeout(3000) }
+        );
+      } catch {
+        // non-fatal
+      }
+
+      const cleanLabel = (tag.vehicleLabel || '').trim();
+      const cleanPlate = (tag.plateHint || '').trim();
+      const vehicleHeader =
+        cleanLabel && cleanPlate
+          ? `${cleanLabel} (${cleanPlate})`
+          : cleanLabel || cleanPlate || tag.code;
+
+      const testPayload = [
+        `✅ RelayTag 2-Way Connected — ${vehicleHeader}`,
+        `Tag ID: ${tag.code}`,
+        `Status: Instant Telegram alerts & direct 2-way replies are active!`,
+        `↩️ Reply directly to any scan alert in Telegram to message the scanner back, or send /dnd here anytime to turn off alerts.`,
+      ].join('\n');
+
+      const result = await sendTelegramMessageWithRetry(
+        validation.cleanBotToken,
+        validation.cleanChatId,
+        testPayload
+      );
+
+      if (!result.forwarded) {
+        res.status(400).json({
+          ok: false,
+          error: result.error || 'Could not deliver test message to Telegram.',
+        });
+        return;
+      }
+
+      // Automatically save and enable the verified credentials
+      tag.telegramEnabled = true;
+      tag.telegramBotToken = validation.cleanBotToken;
+      tag.telegramChatId = validation.cleanChatId;
+      tag.updatedAt = now;
+      lastLocalMutationMap.set(tag.code.toUpperCase(), now);
+      hydratedTagTimestamps.set(tag.code.toUpperCase(), now);
+      saveStore(store);
+
+      const vault = buildVaultForTag(tag);
+
+      res.json({
+        ok: true,
+        tag: toOwnerTagView(tag),
+        vault,
+        serverTime: now,
+      });
+    })
+  );
+
+  app.post(
+    '/api/owner/tags/:id/simulate-telegram-reply',
+    requireOwnerAuth,
+    asyncHandler(async (req, res) => {
+      const now = Date.now();
+      const store = getCleanedStore(now);
+      const tag = store.tags.find((t) => t.id === req.params.id);
+      if (!tag) {
+        res.status(404).json({ error: 'Tag not found' });
+        return;
+      }
+
+      // First pull any real pending replies from Telegram if configured
+      await syncTelegramBotRepliesIfNeeded(store, tag, now, true);
+
+      const { text, sessionId } = (req.body || {}) as {
+        text?: unknown;
+        sessionId?: unknown;
+      };
+      const replyText =
+        typeof text === 'string' && text.trim()
+          ? text.trim()
+          : 'On my way down right now — thanks for scanning! (Sent directly from Telegram)';
+
+      const simulatedUpdateId = Math.max((tag.lastTelegramUpdateId || 1000) + 1, now);
+      const simulatedChatId = tag.telegramChatId.trim() || '999999999';
+      const targetSession = resolveTargetScannerSession(store.messages, tag.id, sessionId);
+
+      const fakeUpdate: TelegramIncomingUpdate = {
+        update_id: simulatedUpdateId,
+        message: {
+          text: replyText,
+          chat: { id: simulatedChatId },
+          from: { is_bot: false },
+          reply_to_message: targetSession
+            ? { text: `Session: #${targetSession}` }
+            : undefined,
+        },
+      };
+
+      const prevChatId = tag.telegramChatId;
+      tag.telegramChatId = simulatedChatId;
+      const outcome = applyParsedTelegramUpdate(store, tag, fakeUpdate, now);
+      tag.telegramChatId = prevChatId;
+      saveStore(store);
+
+      res.status(201).json({
+        ok: outcome.applied,
+        message: outcome.replyMessage,
+        serverTime: now,
+      });
+    })
+  );
+
+  app.post(
+    '/api/telegram/webhook/:code',
+    asyncHandler(async (req, res) => {
+      const now = Date.now();
+      const store = getCleanedStore(now);
+      const code = (req.params.code || '').trim().toUpperCase();
+      const tag = await findOrHydrateTagByCode(store, code, now);
+      if (!tag || !tag.telegramEnabled || !tag.telegramBotToken.trim()) {
+        res.status(200).json({ ok: true });
+        return;
+      }
+
+      // Verify cryptographic Telegram webhook secret token to block unauthorized webhook spoofing
+      const providedSecret = String(
+        req.headers['x-telegram-bot-api-secret-token'] || req.query.secret || ''
+      ).trim();
+      const expectedSecret = computeTelegramWebhookSecret(tag.code, tag.telegramBotToken);
+      const a = Buffer.from(providedSecret, 'utf8');
+      const b = Buffer.from(expectedSecret, 'utf8');
+      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+        res.status(401).json({ error: 'Unauthorized webhook secret token.' });
+        return;
+      }
+
+      const update = req.body as TelegramIncomingUpdate;
+      if (update && typeof update.update_id === 'number') {
+        const outcome = applyParsedTelegramUpdate(store, tag, update, now);
+        const vehicleDisplay = tag.plateHint || tag.vehicleLabel || tag.code;
+        if (outcome.applied && tag.telegramBotToken && tag.telegramChatId) {
+          if (outcome.replyMessage) {
+            void sendTelegramMessageWithRetry(
+              tag.telegramBotToken,
+              tag.telegramChatId,
+              `✓ Reply delivered to scanner on ${vehicleDisplay}: "${outcome.replyMessage.text}"`
+            );
+          } else if (outcome.dndChanged) {
+            void sendTelegramMessageWithRetry(
+              tag.telegramBotToken,
+              tag.telegramChatId,
+              tag.contactEnabled
+                ? `🟢 ${vehicleDisplay} is now Reachable (ON).`
+                : `🔒 ${vehicleDisplay} switched to Do Not Disturb (OFF). Incoming QR scans are now paused.`
+            );
+          }
+        }
+      }
+      res.status(200).json({ ok: true });
+    })
+  );
 
   app.post('/api/owner/tags/:id/reply', requireOwnerAuth, (req, res) => {
     const now = Date.now();
@@ -959,6 +1632,7 @@ async function startServer() {
               senderAlias: (item.senderAlias || 'Passerby').slice(0, 40),
               text: item.text.slice(0, 500),
               createdAt: typeof item.createdAt === 'number' ? item.createdAt : now,
+              telegramForwarded: Boolean(item.telegramForwarded),
               viaTelegram: Boolean(item.viaTelegram),
             });
             added = true;
@@ -982,201 +1656,231 @@ async function startServer() {
     res.json({ ok: true, serverTime: now });
   });
 
-  app.get('/api/public/tags/:code', async (req, res) => {
-    const now = Date.now();
-    const store = getCleanedStore(now);
-    const code = (req.params.code || '').trim().toUpperCase();
-    const tag = store.tags.find((t) => t.code.toUpperCase() === code);
-    if (!tag) {
-      res.setHeader('Cache-Control', 'public, max-age=30');
-      res.status(404).json({ error: 'Windshield tag code not found.' });
-      return;
-    }
+  app.get(
+    '/api/public/tags/:code',
+    asyncHandler(async (req, res) => {
+      const now = Date.now();
+      const store = getCleanedStore(now);
+      const code = (req.params.code || '').trim().toUpperCase();
+      const clientIp = extractClientIp(
+        req.headers['x-forwarded-for'],
+        req.ip || req.socket.remoteAddress
+      );
 
-    const clientIp = extractClientIp(
-      req.headers['x-forwarded-for'],
-      req.ip || req.socket.remoteAddress
-    );
-    const initiallyActive = isContactWindowActive(tag.contactEnabled, tag.autoExpireAt, now);
+      let tag = store.tags.find((t) => t.code.toUpperCase() === code) || null;
+      if (tag) {
+        const initiallyActive = isContactWindowActive(tag.contactEnabled, tag.autoExpireAt, now);
+        // Zero-Disruption DND Shield: When Reachable is OFF, block repeated QR spam in-memory before any I/O
+        if (!initiallyActive) {
+          const dndCheck = checkDndSpamShield(scannerRateLimitMap, `${code}:${clientIp}`, now);
+          if (!dndCheck.allowed) {
+            res.setHeader('Cache-Control', 'public, max-age=30');
+            res.setHeader('Retry-After', String(dndCheck.retryAfterSeconds));
+            res.status(429).json({
+              tag: toPublicTagView(tag, now),
+              messages: [],
+              dndStandbyShield: true,
+              retryAfterSeconds: dndCheck.retryAfterSeconds,
+              serverTime: now,
+            });
+            return;
+          }
+        }
+        await hydrateTagFromFirestoreIfNeeded(store, tag);
+      } else {
+        const lookupCheck = checkDndSpamShield(scannerRateLimitMap, `lookup:${code}:${clientIp}`, now);
+        if (!lookupCheck.allowed) {
+          res.setHeader('Retry-After', String(lookupCheck.retryAfterSeconds));
+          res.status(429).json({
+            error: 'Too many tag lookup requests. Please wait before retrying.',
+            retryAfterSeconds: lookupCheck.retryAfterSeconds,
+          });
+          return;
+        }
+        tag = await findOrHydrateTagByCode(store, code, now);
+        if (!tag) {
+          res.setHeader('Cache-Control', 'no-store');
+          res.status(404).json({ error: 'Windshield tag code not found.' });
+          return;
+        }
+      }
 
-    // Zero-Disruption DND Shield: When Reachable is OFF, block repeated QR spam in-memory before any I/O
-    if (!initiallyActive) {
-      const dndCheck = checkDndSpamShield(scannerRateLimitMap, `${code}:${clientIp}`, now);
-      if (!dndCheck.allowed) {
-        res.setHeader('Cache-Control', 'public, max-age=30');
-        res.setHeader('Retry-After', String(dndCheck.retryAfterSeconds));
-        res.status(429).json({
-          tag: toPublicTagView(tag, now),
+      const publicView = toPublicTagView(tag, now);
+
+      // If tag is in Do Not Disturb (Reachable OFF), return minimal response without polling Telegram
+      if (!publicView.contactEnabled) {
+        res.setHeader('Cache-Control', 'no-store');
+        res.json({
+          tag: publicView,
           messages: [],
           dndStandbyShield: true,
-          retryAfterSeconds: dndCheck.retryAfterSeconds,
           serverTime: now,
         });
         return;
       }
-    }
 
-    await hydrateTagFromFirestoreIfNeeded(store, tag);
+      // Tag is Reachable (ON): check for any direct Telegram replies from the owner
+      await syncTelegramBotRepliesIfNeeded(store, tag, now);
 
-    const publicView = toPublicTagView(tag, now);
+      // Re-evaluate publicView in case the owner sent /dnd via Telegram just now
+      const refreshedPublicView = toPublicTagView(tag, now);
+      const rawSession = req.query.sessionId || req.headers['x-scanner-session'];
+      const scannerSessionId = sanitizeScannerSessionId(rawSession);
 
-    // If tag is in Do Not Disturb (Reachable OFF), return cacheable minimal response without polling Telegram
-    if (!publicView.contactEnabled) {
-      res.setHeader('Cache-Control', 'public, max-age=15, stale-while-revalidate=30');
+      // Isolate conversation thread to the active scanner session only
+      const thread = filterMessagesForPublicScanner(
+        store.messages,
+        tag.id,
+        refreshedPublicView.contactEnabled,
+        scannerSessionId
+      );
+
+      res.setHeader('Cache-Control', 'no-store');
       res.json({
-        tag: publicView,
-        messages: [],
-        dndStandbyShield: true,
+        tag: refreshedPublicView,
+        messages: thread,
         serverTime: now,
       });
-      return;
-    }
+    })
+  );
 
-    // Tag is Reachable (ON): check for any direct Telegram replies from the owner
-    await syncTelegramBotRepliesIfNeeded(store, tag, now);
+  app.post(
+    '/api/public/tags/:code/messages',
+    asyncHandler(async (req, res) => {
+      const now = Date.now();
+      const store = getCleanedStore(now);
+      const code = (req.params.code || '').trim().toUpperCase();
+      const clientIp = extractClientIp(
+        req.headers['x-forwarded-for'],
+        req.ip || req.socket.remoteAddress
+      );
 
-    // Re-evaluate publicView in case the owner sent /dnd via Telegram just now
-    const refreshedPublicView = toPublicTagView(tag, now);
-    const rawSession = req.query.sessionId || req.headers['x-scanner-session'];
-    const scannerSessionId = sanitizeScannerSessionId(rawSession);
+      let tag = store.tags.find((t) => t.code.toUpperCase() === code) || null;
+      if (tag) {
+        // Fast in-memory DND spam guard before any external Firestore/Telegram calls
+        if (!isContactWindowActive(tag.contactEnabled, tag.autoExpireAt, now)) {
+          const dndCheck = checkDndSpamShield(scannerRateLimitMap, `post:${code}:${clientIp}`, now);
+          if (!dndCheck.allowed) {
+            res.setHeader('Retry-After', String(dndCheck.retryAfterSeconds));
+            res.status(429).json({
+              error: 'Vehicle is in Do Not Disturb mode. Requests are paused.',
+              retryAfterSeconds: dndCheck.retryAfterSeconds,
+            });
+            return;
+          }
+        }
+        await hydrateTagFromFirestoreIfNeeded(store, tag);
+      } else {
+        const lookupCheck = checkDndSpamShield(scannerRateLimitMap, `post-lookup:${code}:${clientIp}`, now);
+        if (!lookupCheck.allowed) {
+          res.setHeader('Retry-After', String(lookupCheck.retryAfterSeconds));
+          res.status(429).json({
+            error: 'Too many requests. Please wait before retrying.',
+            retryAfterSeconds: lookupCheck.retryAfterSeconds,
+          });
+          return;
+        }
+        tag = await findOrHydrateTagByCode(store, code, now);
+        if (!tag) {
+          res.status(404).json({ error: 'Windshield tag code not found.' });
+          return;
+        }
+      }
 
-    // Isolate conversation thread to the active scanner session only
-    const thread = filterMessagesForPublicScanner(
-      store.messages,
-      tag.id,
-      refreshedPublicView.contactEnabled,
-      scannerSessionId
-    );
+      const contactActive = isContactWindowActive(tag.contactEnabled, tag.autoExpireAt, now);
+      const { text, category, senderAlias, sessionId } = (req.body || {}) as {
+        text?: unknown;
+        category?: unknown;
+        senderAlias?: unknown;
+        sessionId?: unknown;
+      };
 
-    res.json({
-      tag: refreshedPublicView,
-      messages: thread,
-      serverTime: now,
-    });
-  });
+      const validation = validateIncomingMessage(text, contactActive);
+      if (!validation.valid) {
+        res.status(403).json({ error: validation.error });
+        return;
+      }
 
-  app.post('/api/public/tags/:code/messages', async (req, res) => {
-    const now = Date.now();
-    const store = getCleanedStore(now);
-    const code = (req.params.code || '').trim().toUpperCase();
-    const tag = store.tags.find((t) => t.code.toUpperCase() === code);
-    if (!tag) {
-      res.status(404).json({ error: 'Windshield tag code not found.' });
-      return;
-    }
+      const scannerSessionId =
+        sanitizeScannerSessionId(sessionId || req.headers['x-scanner-session']) ||
+        `scan-${crypto.randomBytes(6).toString('hex')}`;
 
-    const clientIp = extractClientIp(
-      req.headers['x-forwarded-for'],
-      req.ip || req.socket.remoteAddress
-    );
-
-    // Fast in-memory DND spam guard before any external Firestore/Telegram calls
-    if (!isContactWindowActive(tag.contactEnabled, tag.autoExpireAt, now)) {
-      const dndCheck = checkDndSpamShield(scannerRateLimitMap, `post:${code}:${clientIp}`, now);
-      if (!dndCheck.allowed) {
-        res.setHeader('Retry-After', String(dndCheck.retryAfterSeconds));
-        res.status(429).json({
-          error: 'Vehicle is in Do Not Disturb mode. Requests are paused.',
-          retryAfterSeconds: dndCheck.retryAfterSeconds,
+      // Prevent accidental double-tap duplicate message bursts within 2 seconds for the same scanner session
+      const recentDuplicate = store.messages.find(
+        (m) =>
+          m.tagId === tag.id &&
+          m.sender === 'scanner' &&
+          m.sessionId === scannerSessionId &&
+          m.text === validation.sanitizedText &&
+          now - m.createdAt < 2000
+      );
+      if (recentDuplicate) {
+        res.status(200).json({
+          message: recentDuplicate,
+          sessionId: recentDuplicate.sessionId || scannerSessionId,
+          telegramForwarded: Boolean(recentDuplicate.telegramForwarded),
+          deduplicated: true,
         });
         return;
       }
-    }
 
-    await hydrateTagFromFirestoreIfNeeded(store, tag);
+      // Per-scanner/IP sliding-window rate limit (max 5 alerts per 60s)
+      const rateKey = `${tag.code}:${scannerSessionId}:${clientIp}`;
+      const rateCheck = checkScannerRateLimit(scannerRateLimitMap, rateKey, now);
+      if (!rateCheck.allowed) {
+        res.status(429).json({
+          error: `Rate limit reached. Please wait ${rateCheck.retryAfterSeconds}s before sending another alert.`,
+          retryAfterSeconds: rateCheck.retryAfterSeconds,
+        });
+        return;
+      }
 
-    const contactActive = isContactWindowActive(tag.contactEnabled, tag.autoExpireAt, now);
-    const { text, category, senderAlias, sessionId } = (req.body || {}) as {
-      text?: unknown;
-      category?: unknown;
-      senderAlias?: unknown;
-      sessionId?: unknown;
-    };
+      const rawAlias = typeof senderAlias === 'string' ? senderAlias.trim().slice(0, 32) : '';
+      const cleanAlias =
+        rawAlias || `Passerby #${Math.floor(100 + Math.random() * 900)}`;
 
-    const validation = validateIncomingMessage(text, contactActive);
-    if (!validation.valid) {
-      res.status(403).json({ error: validation.error });
-      return;
-    }
+      const cleanCategory =
+        typeof category === 'string' && category.trim()
+          ? category.trim().slice(0, 24)
+          : undefined;
 
-    const scannerSessionId =
-      sanitizeScannerSessionId(sessionId || req.headers['x-scanner-session']) ||
-      `scan-${crypto.randomBytes(6).toString('hex')}`;
+      const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+      const host = req.get('host');
+      const fallbackOrigin = host ? `${proto}://${host}` : undefined;
 
-    // Prevent accidental double-tap duplicate message bursts within 2 seconds
-    const recentDuplicate = store.messages.find(
-      (m) =>
-        m.tagId === tag.id &&
-        m.sender === 'scanner' &&
-        m.text === validation.sanitizedText &&
-        now - m.createdAt < 2000
-    );
-    if (recentDuplicate) {
-      res.status(200).json({
-        message: recentDuplicate,
-        sessionId: recentDuplicate.sessionId || scannerSessionId,
-        telegramForwarded: Boolean(recentDuplicate.telegramForwarded),
-        deduplicated: true,
+      const telegramResult = await forwardToTelegramIfConfigured(
+        tag,
+        cleanAlias,
+        validation.sanitizedText,
+        cleanCategory,
+        scannerSessionId,
+        fallbackOrigin
+      );
+
+      const newMsg: RelayMessage = {
+        id: `msg-${now}-${Math.random().toString(36).slice(2, 6)}`,
+        tagId: tag.id,
+        sessionId: scannerSessionId,
+        sender: 'scanner',
+        senderAlias: cleanAlias,
+        text: validation.sanitizedText,
+        category: cleanCategory,
+        createdAt: now,
+        telegramForwarded: telegramResult.forwarded,
+      };
+
+      store.messages.push(newMsg);
+      cleanupStoreState(store, now);
+      saveStore(store);
+
+      res.status(201).json({
+        message: newMsg,
+        sessionId: scannerSessionId,
+        telegramForwarded: telegramResult.forwarded,
+        serverTime: now,
       });
-      return;
-    }
-
-    // Per-scanner/IP sliding-window rate limit (max 5 alerts per 60s)
-    const rateKey = `${tag.code}:${scannerSessionId}:${clientIp}`;
-    const rateCheck = checkScannerRateLimit(scannerRateLimitMap, rateKey, now);
-    if (!rateCheck.allowed) {
-      res.status(429).json({
-        error: `Rate limit reached. Please wait ${rateCheck.retryAfterSeconds}s before sending another alert.`,
-        retryAfterSeconds: rateCheck.retryAfterSeconds,
-      });
-      return;
-    }
-
-    const rawAlias = typeof senderAlias === 'string' ? senderAlias.trim().slice(0, 32) : '';
-    const cleanAlias =
-      rawAlias || `Passerby #${Math.floor(100 + Math.random() * 900)}`;
-
-    const cleanCategory =
-      typeof category === 'string' && category.trim()
-        ? category.trim().slice(0, 24)
-        : undefined;
-
-    const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
-    const host = req.get('host');
-    const fallbackOrigin = host ? `${proto}://${host}` : undefined;
-
-    const telegramResult = await forwardToTelegramIfConfigured(
-      tag,
-      cleanAlias,
-      validation.sanitizedText,
-      cleanCategory,
-      scannerSessionId,
-      fallbackOrigin
-    );
-
-    const newMsg: RelayMessage = {
-      id: `msg-${now}-${Math.random().toString(36).slice(2, 6)}`,
-      tagId: tag.id,
-      sessionId: scannerSessionId,
-      sender: 'scanner',
-      senderAlias: cleanAlias,
-      text: validation.sanitizedText,
-      category: cleanCategory,
-      createdAt: now,
-      telegramForwarded: telegramResult.forwarded,
-    };
-
-    store.messages.push(newMsg);
-    cleanupStoreState(store, now);
-    saveStore(store);
-
-    res.status(201).json({
-      message: newMsg,
-      sessionId: scannerSessionId,
-      telegramForwarded: telegramResult.forwarded,
-      serverTime: now,
-    });
-  });
+    })
+  );
 
   // Catch unmatched /api/* routes before SPA fallback
   app.all('/api/*', (_req, res) => {

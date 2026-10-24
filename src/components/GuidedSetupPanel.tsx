@@ -276,6 +276,7 @@ export const GuidedSetupPanel: React.FC<GuidedSetupPanelProps> = ({
                   <input
                     id="telegram-bot-token-input"
                     type={revealToken ? 'text' : 'password'}
+                    maxLength={120}
                     value={telegramBotToken}
                     onChange={(e) => onChangeBotToken(e.target.value)}
                     placeholder="123456789:AAHdqTcvCH1v..."
@@ -309,6 +310,7 @@ export const GuidedSetupPanel: React.FC<GuidedSetupPanelProps> = ({
                   id="telegram-chat-id-input"
                   type="text"
                   inputMode="numeric"
+                  maxLength={60}
                   value={telegramChatId}
                   onChange={(e) => onChangeChatId(e.target.value)}
                   placeholder="e.g. 987654321"
