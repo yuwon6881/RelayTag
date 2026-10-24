@@ -377,6 +377,11 @@ export default function App() {
             },
           }
         );
+        if (res.status >= 500) {
+          // Temporary server trouble is not "tag not found": stay on the loading card and retry.
+          setLoading(false);
+          return;
+        }
         const data = await res.json();
         if (!res.ok && res.status !== 429) {
           setPublicNotFoundError(data.error || 'Windshield tag code not found.');
@@ -524,6 +529,8 @@ export default function App() {
     isPublicScanRoute,
     contactEnabled: publicScanTag?.contactEnabled,
     hasNotFoundError: Boolean(publicNotFoundError),
+    tagLoaded: Boolean(publicScanTag),
+    ownerUnlocked: isOwnerConsoleUnlocked,
   });
 
   useEffect(() => {

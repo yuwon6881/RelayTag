@@ -301,23 +301,36 @@ function pruneBoundedTimestampMap(map: Map<string, number>, now: number, ttlMs: 
   }
 }
 
+// 'missing' means Firestore answered and has no such tag; 'unavailable' means we could not ask
+// (timeout, network, 429/5xx). Callers must not report a real tag as nonexistent for the latter.
+type HydrationOutcome = 'ok' | 'missing' | 'unavailable';
+
+class TagLookupUnavailableError extends Error {}
+
+const HYDRATE_REFRESH_MS = 30_000;
+const HYDRATE_RETRY_AFTER_FAILURE_MS = 5_000;
+
 async function hydrateTagFromFirestoreIfNeeded(
   store: StoreSchema,
   tag: TagConfig,
   forceLookup = false
-): Promise<boolean> {
+): Promise<HydrationOutcome> {
   const code = tag.code.toUpperCase();
   const now = Date.now();
   const lastHydrated = hydratedTagTimestamps.get(code) || 0;
   // Re-verify from Firestore on cold start (lastHydrated === 0) or every 30s when public scanners poll
-  if (!forceLookup && lastHydrated > 0 && now - lastHydrated < 30_000) {
-    return true;
+  if (!forceLookup && lastHydrated > 0 && now - lastHydrated < HYDRATE_REFRESH_MS) {
+    return 'ok';
   }
   if (!firebaseConfig.projectId || !firebaseConfig.firestoreDatabaseId) {
-    return false;
+    return 'missing';
   }
 
   hydratedTagTimestamps.set(code, now);
+  // A failed lookup must not freeze a stale (default, Do Not Disturb) tag for a full refresh window.
+  const retrySoon = () => {
+    hydratedTagTimestamps.set(code, Date.now() - (HYDRATE_REFRESH_MS - HYDRATE_RETRY_AFTER_FAILURE_MS));
+  };
   const baseUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
     firebaseConfig.projectId
   )}/databases/${encodeURIComponent(firebaseConfig.firestoreDatabaseId)}/documents`;
@@ -335,8 +348,12 @@ async function hydrateTagFromFirestoreIfNeeded(
       fetch(vaultUrl, { signal: AbortSignal.timeout(3500) }).catch(() => null),
     ]);
 
-    if (!tagRes || !tagRes.ok) {
-      return false;
+    if (!tagRes || tagRes.status === 429 || tagRes.status >= 500) {
+      retrySoon();
+      return 'unavailable';
+    }
+    if (!tagRes.ok) {
+      return 'missing';
     }
 
     let vaultRes = primaryVaultRes;
@@ -364,7 +381,7 @@ async function hydrateTagFromFirestoreIfNeeded(
     };
     const f = docJson.fields;
     if (!f) {
-      return false;
+      return 'missing';
     }
 
     const fsUpdatedIso = f.updatedAt?.timestampValue || docJson.updateTime || '';
@@ -431,9 +448,10 @@ async function hydrateTagFromFirestoreIfNeeded(
       cleanupStoreState(store, Date.now());
       saveStore(store);
     }
-    return true;
+    return 'ok';
   } catch {
-    return false;
+    retrySoon();
+    return 'unavailable';
   }
 }
 
@@ -465,8 +483,11 @@ async function findOrHydrateTagByCode(
     code,
   };
 
-  const foundInFirestore = await hydrateTagFromFirestoreIfNeeded(store, candidateTag, true);
-  if (!foundInFirestore) {
+  const outcome = await hydrateTagFromFirestoreIfNeeded(store, candidateTag, true);
+  if (outcome === 'unavailable') {
+    throw new TagLookupUnavailableError('Tag lookup temporarily unavailable.');
+  }
+  if (outcome === 'missing') {
     pruneBoundedTimestampMap(missingTagLookupCache, now, 30_000);
     missingTagLookupCache.set(code, now);
     return null;
@@ -1917,7 +1938,13 @@ async function startServer() {
         },
       })
     );
-    app.get('*', (_req, res) => {
+    app.get('*', (req, res) => {
+      // A missing hashed bundle must fail loudly, not come back as HTML that the browser then
+      // tries to run as JavaScript.
+      if (req.path.startsWith('/assets/')) {
+        res.status(404).type('text/plain').send('Not found');
+        return;
+      }
       if (fs.existsSync(distIndexHtml)) {
         res.setHeader('Cache-Control', 'no-cache');
         res.sendFile(distIndexHtml);
@@ -1931,6 +1958,11 @@ async function startServer() {
   app.use((err: Error & { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
     if (err instanceof SyntaxError || err.type === 'entity.parse.failed') {
       res.status(400).json({ error: 'Invalid JSON payload.' });
+      return;
+    }
+    if (err instanceof TagLookupUnavailableError) {
+      res.setHeader('Retry-After', String(HYDRATE_RETRY_AFTER_FAILURE_MS / 1000));
+      res.status(503).json({ error: 'Tag lookup is temporarily unavailable. Please try again.' });
       return;
     }
     if (err.type === 'entity.too.large') {

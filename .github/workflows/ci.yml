@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # The real Firebase web config is gitignored (it ships with the deployment, not the repo).
+      # src/firebase.ts imports it, so typecheck and build get a placeholder; tests never reach Firebase.
+      - name: Write placeholder Firebase config
+        run: |
+          cat > firebase-applet-config.json <<'JSON'
+          {"projectId":"ci","firestoreDatabaseId":"ci","apiKey":"ci","appId":"ci","authDomain":"ci.firebaseapp.com"}
+          JSON
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build

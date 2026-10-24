@@ -617,6 +617,47 @@ describe('relayLogic — privacy, DND, 3h timer, rate limiting & store cleanup r
       true
     );
 
+    // Until a first lookup yields a tag, keep retrying so a flaky connection never strands the
+    // scanner on "Loading"; a definite not-found still stops.
+    assert.equal(
+      shouldPollScannerBackend({
+        isPublicScanRoute: true,
+        contactEnabled: undefined,
+        hasNotFoundError: false,
+        tagLoaded: false,
+      }),
+      true
+    );
+    assert.equal(
+      shouldPollScannerBackend({
+        isPublicScanRoute: true,
+        contactEnabled: undefined,
+        hasNotFoundError: true,
+        tagLoaded: false,
+      }),
+      false
+    );
+
+    // A locked owner console must not poll owner endpoints it can only get 401s from.
+    assert.equal(
+      shouldPollScannerBackend({
+        isPublicScanRoute: false,
+        contactEnabled: undefined,
+        hasNotFoundError: false,
+        ownerUnlocked: false,
+      }),
+      false
+    );
+    assert.equal(
+      shouldPollScannerBackend({
+        isPublicScanRoute: false,
+        contactEnabled: undefined,
+        hasNotFoundError: false,
+        ownerUnlocked: true,
+      }),
+      true
+    );
+
     const dndMap = new Map<string, number[]>();
     const now = 5_000_000;
     for (let i = 0; i < 4; i++) {

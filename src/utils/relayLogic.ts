@@ -902,13 +902,19 @@ export function shouldPollScannerBackend(params: {
   isPublicScanRoute: boolean;
   contactEnabled: boolean | null | undefined;
   hasNotFoundError: boolean;
+  // Scan page only: false until a first lookup has produced a tag (slow or failed network), so
+  // the page keeps retrying instead of sitting on "Loading" until the visitor reloads.
+  tagLoaded?: boolean;
+  // Owner console only: a locked console has nothing to poll and would just collect 401s.
+  ownerUnlocked?: boolean;
 }): boolean {
   if (params.hasNotFoundError) return false;
   if (params.isPublicScanRoute) {
+    if (params.tagLoaded === false) return true;
     // When Reachable is OFF (false), never poll the backend from a QR scan page
     return params.contactEnabled === true;
   }
-  return true;
+  return params.ownerUnlocked !== false;
 }
 
 export function computeRemainingMinutes(
