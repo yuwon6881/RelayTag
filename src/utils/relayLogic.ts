@@ -1053,22 +1053,21 @@ export function formatRelativeTimestamp(
   });
 }
 
-export function extractClientIp(
-  forwardedForHeader: unknown,
-  remoteAddress?: string | null
-): string {
-  if (typeof forwardedForHeader === 'string' && forwardedForHeader.trim()) {
-    const firstHop = forwardedForHeader.split(',')[0].trim();
-    if (firstHop && /^[a-fA-F0-9:.,\s]{3,64}$/.test(firstHop)) {
-      return firstHop.slice(0, 64);
-    }
-  } else if (Array.isArray(forwardedForHeader) && typeof forwardedForHeader[0] === 'string') {
-    const firstHop = forwardedForHeader[0].split(',')[0].trim();
-    if (firstHop && /^[a-fA-F0-9:.,\s]{3,64}$/.test(firstHop)) {
-      return firstHop.slice(0, 64);
-    }
-  }
+export const MIN_VAULT_SECRET_LENGTH = 32;
 
+export function assertVaultSecretConfigured(secret: string | undefined, nodeEnv: string | undefined): void {
+  if (nodeEnv !== 'production') return;
+  if (!secret || secret.trim().length < MIN_VAULT_SECRET_LENGTH) {
+    throw new Error(
+      `RELAYTAG_VAULT_SECRET must be set to at least ${MIN_VAULT_SECRET_LENGTH} random characters in production.`
+    );
+  }
+}
+
+// Takes Express's proxy-resolved `req.ip` (with `trust proxy` set to the real hop count).
+// X-Forwarded-For is deliberately not read here: its leading entries are client-controlled,
+// so keying rate limits on them lets an attacker mint a fresh bucket per request.
+export function extractClientIp(remoteAddress?: string | null): string {
   if (typeof remoteAddress === 'string' && remoteAddress.trim()) {
     return remoteAddress.trim().slice(0, 64);
   }

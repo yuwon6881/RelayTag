@@ -34,6 +34,7 @@ import {
   formatRelativeTimestamp,
   RELATIVE_TIMESTAMP_REFRESH_MS,
   extractClientIp,
+  assertVaultSecretConfigured,
   buildOwnerSessionCookie,
   computeHealthSummary,
   generateNewTagCode,
@@ -661,20 +662,24 @@ describe('relayLogic — privacy, DND, 3h timer, rate limiting & store cleanup r
     assert.equal(formatRelativeTimestamp(Number.NaN, baseTime), 'Just now');
   });
 
+  it('refuses to run in production without a strong server-only vault secret', () => {
+    // Without it every vault key derives from public project identifiers, so anyone could
+    // compute vault IDs and decrypt Telegram tokens and the owner PIN hash.
+    assert.throws(() => assertVaultSecretConfigured('', 'production'), /RELAYTAG_VAULT_SECRET/);
+    assert.throws(() => assertVaultSecretConfigured(undefined, 'production'), /RELAYTAG_VAULT_SECRET/);
+    assert.throws(() => assertVaultSecretConfigured('too-short', 'production'), /RELAYTAG_VAULT_SECRET/);
+    assert.doesNotThrow(() => assertVaultSecretConfigured('x'.repeat(32), 'production'));
+    assert.doesNotThrow(() => assertVaultSecretConfigured('', 'development'));
+  });
+
   it('extracts client IP safely behind reverse proxies and constructs secure cookies & health summaries', () => {
-    assert.equal(
-      extractClientIp('203.0.113.42, 10.0.0.1', '127.0.0.1'),
-      '203.0.113.42'
-    );
-    assert.equal(
-      extractClientIp(['198.51.100.7, 10.0.0.2'], '127.0.0.1'),
-      '198.51.100.7'
-    );
-    assert.equal(
-      extractClientIp('<script>malicious</script>', '127.0.0.1'),
-      '127.0.0.1'
-    );
-    assert.equal(extractClientIp(undefined, undefined), 'unknown');
+    // The caller passes Express's proxy-resolved req.ip. A client-supplied X-Forwarded-For
+    // must never choose the rate-limit key, or rotating it defeats every per-IP limiter.
+    assert.equal(extractClientIp('203.0.113.42'), '203.0.113.42');
+    assert.equal(extractClientIp('  2001:db8::1  '), '2001:db8::1');
+    assert.equal(extractClientIp(undefined), 'unknown');
+    assert.equal(extractClientIp(''), 'unknown');
+    assert.equal(extractClientIp('x'.repeat(200)).length, 64);
 
     const secureCookie = buildOwnerSessionCookie('rt_own_abc', true);
     assert.match(secureCookie, /SameSite=None; Secure/);

@@ -33,6 +33,7 @@ import {
   hasTagSetupData,
   normalizePersistedTagFields,
   extractClientIp,
+  assertVaultSecretConfigured,
   buildOwnerSessionCookie,
   computeHealthSummary,
   generateNewTagCode,
@@ -57,6 +58,8 @@ const firebaseConfig: FirebaseAppletConfig = (() => {
     return {};
   }
 })();
+
+assertVaultSecretConfigured(process.env.RELAYTAG_VAULT_SECRET, process.env.NODE_ENV);
 
 // Server-only secret entropy (never exposed to browser bundle) combined with project identifiers
 const SERVER_ONLY_ENTROPY =
@@ -881,7 +884,13 @@ async function startServer() {
 
   // Production reverse-proxy & security hardening
   app.disable('x-powered-by');
-  app.set('trust proxy', 1);
+  // Number of reverse-proxy hops that append to X-Forwarded-For. Must match the real topology:
+  // too high lets clients spoof their rate-limit identity, 0 behind a proxy collapses all users to one IP.
+  const trustProxyHops = Number.parseInt(
+    process.env.TRUST_PROXY_HOPS ?? (process.env.NODE_ENV === 'production' ? '1' : '0'),
+    10
+  );
+  app.set('trust proxy', Number.isInteger(trustProxyHops) && trustProxyHops >= 0 ? trustProxyHops : 0);
 
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -958,10 +967,7 @@ async function startServer() {
         await hydrateTagFromFirestoreIfNeeded(store, primaryTag);
       }
 
-      const clientIp = extractClientIp(
-        req.headers['x-forwarded-for'],
-        req.ip || req.socket.remoteAddress
-      );
+      const clientIp = extractClientIp(req.ip || req.socket.remoteAddress);
 
       // Global per-IP rate limit on session creation attempts (prevents token/PIN brute-forcing)
       const sessionRateCheck = checkScannerRateLimit(
@@ -1662,10 +1668,7 @@ async function startServer() {
       const now = Date.now();
       const store = getCleanedStore(now);
       const code = (req.params.code || '').trim().toUpperCase();
-      const clientIp = extractClientIp(
-        req.headers['x-forwarded-for'],
-        req.ip || req.socket.remoteAddress
-      );
+      const clientIp = extractClientIp(req.ip || req.socket.remoteAddress);
 
       let tag = store.tags.find((t) => t.code.toUpperCase() === code) || null;
       if (tag) {
@@ -1750,10 +1753,7 @@ async function startServer() {
       const now = Date.now();
       const store = getCleanedStore(now);
       const code = (req.params.code || '').trim().toUpperCase();
-      const clientIp = extractClientIp(
-        req.headers['x-forwarded-for'],
-        req.ip || req.socket.remoteAddress
-      );
+      const clientIp = extractClientIp(req.ip || req.socket.remoteAddress);
 
       let tag = store.tags.find((t) => t.code.toUpperCase() === code) || null;
       if (tag) {
