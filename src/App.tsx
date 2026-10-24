@@ -72,6 +72,10 @@ import {
   RELATIVE_TIMESTAMP_REFRESH_MS,
   buildDownloadableTagSvgBadge,
   sanitizeBadgeFilename,
+  resolveScannerSession,
+  touchScannerSession,
+  createScannerSessionId,
+  type ScannerSessionStore,
 } from './utils/relayLogic';
 import { QrCodeVector } from './components/QrCodeVector';
 import { PublicScannerPanel } from './components/PublicScannerPanel';
@@ -81,24 +85,22 @@ import { MessageList } from './components/MessageList';
 type OwnerPage = 'control' | 'messages';
 type ThemePreference = 'system' | 'light' | 'dark';
 
-function getOrCreateScannerSessionId(): string {
-  if (typeof window === 'undefined') return 'scan-ssr-fallback';
+function scannerSessionStore(): ScannerSessionStore | null {
   try {
-    const existing = window.localStorage.getItem('relaytag-scanner-session');
-    if (existing && /^[a-zA-Z0-9_-]{8,64}$/.test(existing)) {
-      return existing;
-    }
-    const randomPart =
-      typeof crypto !== 'undefined' && 'randomUUID' in crypto
-        ? crypto.randomUUID().replace(/-/g, '').slice(0, 12)
-        : Math.random().toString(36).slice(2, 10) +
-          Math.random().toString(36).slice(2, 6);
-    const created = `scan-${randomPart}`;
-    window.localStorage.setItem('relaytag-scanner-session', created);
-    return created;
+    return typeof window === 'undefined' ? null : window.sessionStorage;
   } catch {
-    return 'scan-ephemeral-session';
+    return null;
   }
+}
+
+function getOrCreateScannerSessionId(): string {
+  // The earlier build kept one ID per browser forever; drop it so old chats never reappear.
+  try {
+    window.localStorage.removeItem('relaytag-scanner-session');
+  } catch {
+    // storage blocked
+  }
+  return resolveScannerSession(scannerSessionStore(), Date.now(), createScannerSessionId);
 }
 
 export default function App() {
@@ -1370,6 +1372,7 @@ export default function App() {
         };
       }
       // Scanner messages stay server-side: Firestore rejects unauthenticated writes by design.
+      touchScannerSession(scannerSessionStore(), scannerSessionIdRef.current, Date.now());
       await fetchState();
       return { ok: true, telegramForwarded: data.telegramForwarded };
     } catch {

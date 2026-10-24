@@ -200,6 +200,60 @@ export function sanitizeScannerSessionId(rawSessionId: unknown): string | null {
   return trimmed;
 }
 
+// The session ID is the only thing that scopes a scanner to its own thread, so it must be
+// unguessable, never shared between visitors, and never outlive the scan that created it.
+export const SCANNER_SESSION_KEY = 'relaytag-scanner-session-v2';
+export const SCANNER_SESSION_IDLE_MS = 30 * 60 * 1000;
+
+export interface ScannerSessionStore {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+export function createScannerSessionId(): string {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return `scan-${Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
+}
+
+// Pass a per-tab store (sessionStorage): a new tab from a new scan starts clean, a refresh
+// continues. An idle session also expires, so a tab left open does not resurrect an old chat.
+// With no usable store the ID is still unique to this page load, never a shared constant.
+export function resolveScannerSession(
+  store: ScannerSessionStore | null,
+  nowMs: number,
+  newId: () => string
+): string {
+  try {
+    const raw = store?.getItem(SCANNER_SESSION_KEY);
+    if (raw) {
+      const saved = JSON.parse(raw) as { id?: unknown; at?: unknown };
+      const id = sanitizeScannerSessionId(saved.id);
+      if (id && typeof saved.at === 'number' && saved.at <= nowMs + 60_000 && nowMs - saved.at < SCANNER_SESSION_IDLE_MS) {
+        touchScannerSession(store ?? null, id, nowMs);
+        return id;
+      }
+    }
+  } catch {
+    // unreadable storage or a corrupt entry: fall through to a fresh session
+  }
+  const id = newId();
+  touchScannerSession(store, id, nowMs);
+  return id;
+}
+
+export function touchScannerSession(
+  store: ScannerSessionStore | null,
+  id: string,
+  nowMs: number
+): void {
+  try {
+    store?.setItem(SCANNER_SESSION_KEY, JSON.stringify({ id, at: nowMs }));
+  } catch {
+    // storage blocked: the session simply lives for this page load
+  }
+}
+
 export function filterMessagesForPublicScanner(
   messages: RelayMessage[],
   tagId: string,

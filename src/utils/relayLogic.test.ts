@@ -26,6 +26,11 @@ import {
   parseTelegramUpdateForOwnerReply,
   checkDndSpamShield,
   checkTagDndCeiling,
+  resolveScannerSession,
+  touchScannerSession,
+  createScannerSessionId,
+  SCANNER_SESSION_KEY,
+  SCANNER_SESSION_IDLE_MS,
   checkLookupBudget,
   checkTagAlertCeiling,
   DND_TAG_MAX_REQUESTS,
@@ -649,6 +654,62 @@ describe('relayLogic — privacy, DND, 3h timer, rate limiting & store cleanup r
       assert.equal(checkTagAlertCeiling(alertMap, 'RT-AAA-111', now + i).allowed, true);
     }
     assert.equal(checkTagAlertCeiling(alertMap, 'RT-AAA-111', now + 100).allowed, false);
+  });
+
+  it('gives every new scan a fresh scanner session and never a shared one', () => {
+    const makeStore = () => {
+      const data = new Map<string, string>();
+      return {
+        getItem: (k: string) => data.get(k) ?? null,
+        setItem: (k: string, v: string) => void data.set(k, v),
+        removeItem: (k: string) => void data.delete(k),
+      };
+    };
+    let n = 0;
+    const newId = () => `scan-fresh${String(++n).padStart(4, '0')}`;
+    const t0 = 1_800_000_000_000;
+
+    // Same tab shortly after: the conversation continues across a refresh.
+    const store = makeStore();
+    const first = resolveScannerSession(store, t0, newId);
+    assert.equal(resolveScannerSession(store, t0 + 60_000, newId), first);
+
+    // Idle past the window (a later scan): a brand-new session, so no earlier chat appears.
+    const later = resolveScannerSession(store, t0 + 60_000 + SCANNER_SESSION_IDLE_MS + 1, newId);
+    assert.notEqual(later, first);
+
+    // Sending keeps an active conversation alive past the idle window.
+    const live = makeStore();
+    const liveId = resolveScannerSession(live, t0, newId);
+    touchScannerSession(live, liveId, t0 + SCANNER_SESSION_IDLE_MS - 1000);
+    assert.equal(resolveScannerSession(live, t0 + SCANNER_SESSION_IDLE_MS + 5000, newId), liveId);
+
+    // Corrupt or tampered entries are ignored.
+    const bad = makeStore();
+    bad.setItem(SCANNER_SESSION_KEY, '{not json');
+    assert.match(resolveScannerSession(bad, t0, newId), /^scan-fresh/);
+    bad.setItem(SCANNER_SESSION_KEY, JSON.stringify({ id: '../x', at: t0 }));
+    assert.match(resolveScannerSession(bad, t0, newId), /^scan-fresh/);
+
+    // Storage unavailable (private mode): still a unique session per call, never a shared constant.
+    const a = resolveScannerSession(null, t0, createScannerSessionId);
+    const b = resolveScannerSession(null, t0, createScannerSessionId);
+    assert.notEqual(a, b);
+    const throwing = {
+      getItem: () => { throw new Error('blocked'); },
+      setItem: () => { throw new Error('blocked'); },
+      removeItem: () => { throw new Error('blocked'); },
+    };
+    assert.notEqual(
+      resolveScannerSession(throwing, t0, createScannerSessionId),
+      resolveScannerSession(throwing, t0, createScannerSessionId)
+    );
+
+    // Generated IDs are valid for the server and carry 128 bits of randomness.
+    const id = createScannerSessionId();
+    assert.match(id, /^scan-[a-f0-9]{32}$/);
+    assert.equal(sanitizeScannerSessionId(id), id);
+    assert.notEqual(createScannerSessionId(), id);
   });
 
   it('formats relative message timestamps accurately across recurring intervals without reloading history', () => {
