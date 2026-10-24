@@ -274,24 +274,18 @@ service cloud.firestore {
 
         allow list: if isAuthorizedOwner() && existing().ownerId == request.auth.uid;
 
-        allow create: if isValidId(tagCode)
+        // Owner-only. Scanner messages go through the rate-limited server API; a public Firestore
+        // write path would bypass every server limit and let anyone run up the Firestore bill.
+        allow create: if isAuthorizedOwner()
+          && isValidId(tagCode)
           && isValidId(messageId)
           && isValidRelayMessage(incoming())
           && incoming().tagCode == tagCode
           && incoming().createdAt == request.time
+          && incoming().sender == 'owner'
+          && incoming().ownerId == request.auth.uid
           && exists(/databases/$(database)/documents/tags/$(tagCode))
-          && get(/databases/$(database)/documents/tags/$(tagCode)).data.ownerId == incoming().ownerId
-          && (
-            (
-              incoming().sender == 'scanner'
-              && get(/databases/$(database)/documents/tags/$(tagCode)).data.contactEnabled == true
-              && (
-                get(/databases/$(database)/documents/tags/$(tagCode)).data.autoExpireAt == 0
-                || request.time.toMillis() < get(/databases/$(database)/documents/tags/$(tagCode)).data.autoExpireAt
-              )
-            ) ||
-            (incoming().sender == 'owner' && isAuthorizedOwner() && request.auth.uid == incoming().ownerId)
-          );
+          && get(/databases/$(database)/documents/tags/$(tagCode)).data.ownerId == request.auth.uid;
 
         allow delete: if isAuthorizedOwner()
           && isValidId(tagCode)

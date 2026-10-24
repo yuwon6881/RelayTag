@@ -1369,9 +1369,7 @@ export default function App() {
               : undefined,
         };
       }
-      if (data.message) {
-        await syncMessageToFirestore(targetCode.toUpperCase(), data.message).catch(() => {});
-      }
+      // Scanner messages stay server-side: Firestore rejects unauthenticated writes by design.
       await fetchState();
       return { ok: true, telegramForwarded: data.telegramForwarded };
     } catch {

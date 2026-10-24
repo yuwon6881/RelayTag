@@ -41,6 +41,7 @@ import {
 
 const SERVER_STARTED_AT = Date.now();
 const OWNER_SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12-hour bounded session lifetime
+const API_REQUESTS_PER_MINUTE = 240; // scanner pages poll every few seconds, so this leaves ample headroom
 const DATA_FILE = path.join(os.tmpdir(), 'relaytag-store-v5.json');
 
 interface FirebaseAppletConfig {
@@ -899,6 +900,23 @@ async function startServer() {
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
     if (req.path.startsWith('/api/owner/')) {
       res.setHeader('Cache-Control', 'no-store');
+    }
+    next();
+  });
+
+  // Blanket per-IP ceiling on every API call, ahead of body parsing and any Firestore/Telegram I/O.
+  // Route-specific limiters (PIN, scanner messages, DND shield) stay stricter.
+  app.use('/api', (req, res, next) => {
+    const now = Date.now();
+    const ip = extractClientIp(req.ip || req.socket.remoteAddress);
+    const check = checkScannerRateLimit(scannerRateLimitMap, `api:${ip}`, now, API_REQUESTS_PER_MINUTE, 60_000);
+    if (!check.allowed) {
+      res.setHeader('Retry-After', String(check.retryAfterSeconds));
+      res.status(429).json({
+        error: 'Too many requests. Please slow down.',
+        retryAfterSeconds: check.retryAfterSeconds,
+      });
+      return;
     }
     next();
   });

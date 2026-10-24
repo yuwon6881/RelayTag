@@ -1,0 +1,11 @@
+# Not derived from .gitignore on purpose: firebase-applet-config.json is gitignored but the build needs it.
+.git
+.gitignore
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+.aistudio/
+.playwright-cli/
