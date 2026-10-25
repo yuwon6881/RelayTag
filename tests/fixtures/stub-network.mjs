@@ -28,8 +28,17 @@ globalThis.fetch = async (input, init) => {
     );
   }
 
+  // Telegram: getUpdates serves the JSON array in STUB_TELEGRAM_UPDATES_FILE; every other call
+  // (sendMessage, deleteWebhook) is appended to STUB_TELEGRAM_SENT_FILE so tests can see what was sent.
   if (url.startsWith('https://api.telegram.org/')) {
-    throw new TypeError('telegram is not reachable in tests');
+    const json = (body) =>
+      new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/getUpdates')) {
+      const updates = JSON.parse(fs.readFileSync(process.env.STUB_TELEGRAM_UPDATES_FILE, 'utf8'));
+      return json({ ok: true, result: updates });
+    }
+    fs.appendFileSync(process.env.STUB_TELEGRAM_SENT_FILE, `${init?.body ?? url}\n`);
+    return json({ ok: true, result: {} });
   }
 
   return realFetch(input, init);

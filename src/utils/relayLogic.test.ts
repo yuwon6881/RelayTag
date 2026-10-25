@@ -24,6 +24,8 @@ import {
   formatTelegramRelayPayload,
   extractSessionIdFromTelegramText,
   parseTelegramUpdateForOwnerReply,
+  isStaleTelegramBacklogUpdate,
+  TELEGRAM_BACKLOG_MAX_AGE_MS,
   checkDndSpamShield,
   checkTagDndCeiling,
   resolveScannerSession,
@@ -588,6 +590,19 @@ describe('relayLogic — privacy, DND, 3h timer, rate limiting & store cleanup r
       'tag-1'
     );
     assert.equal(onCmd.action, 'command-on');
+  });
+
+  it('treats Telegram updates older than the backlog window as stale, and undated ones as fresh', () => {
+    const now = 1_800_000_000_000;
+    const at = (ageMs: number) => ({
+      update_id: 1,
+      message: { date: Math.floor((now - ageMs) / 1000), text: '/on' },
+    });
+    assert.equal(isStaleTelegramBacklogUpdate(at(24 * 60 * 60 * 1000), now), true);
+    assert.equal(isStaleTelegramBacklogUpdate(at(TELEGRAM_BACKLOG_MAX_AGE_MS + 5_000), now), true);
+    assert.equal(isStaleTelegramBacklogUpdate(at(60_000), now), false);
+    assert.equal(isStaleTelegramBacklogUpdate({ update_id: 2, message: { text: '/on' } }, now), false);
+    assert.equal(isStaleTelegramBacklogUpdate({ update_id: 3 }, now), false);
   });
 
   it('halts scanner backend polling when Reachable is OFF and enforces DND spam shield', () => {

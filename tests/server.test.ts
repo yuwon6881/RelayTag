@@ -15,6 +15,8 @@ let server: ChildProcess;
 let baseUrl = '';
 let workDir = '';
 let modeFile = '';
+let telegramUpdatesFile = '';
+let telegramSentFile = '';
 let output = '';
 
 function freePort(): Promise<number> {
@@ -78,6 +80,10 @@ before(async () => {
   );
   modeFile = path.join(workDir, 'firestore-mode');
   fs.writeFileSync(modeFile, 'missing');
+  telegramUpdatesFile = path.join(workDir, 'telegram-updates.json');
+  telegramSentFile = path.join(workDir, 'telegram-sent.log');
+  fs.writeFileSync(telegramUpdatesFile, '[]');
+  fs.writeFileSync(telegramSentFile, '');
 
   const port = await freePort();
   baseUrl = `http://127.0.0.1:${port}`;
@@ -102,6 +108,8 @@ before(async () => {
         TMP: workDir,
         TMPDIR: workDir,
         STUB_FIRESTORE_MODE_FILE: modeFile,
+        STUB_TELEGRAM_UPDATES_FILE: telegramUpdatesFile,
+        STUB_TELEGRAM_SENT_FILE: telegramSentFile,
         STUB_OWNER_EMAIL: AUTHORIZED_OWNER_EMAIL,
       },
     }
@@ -214,5 +222,38 @@ describe('RelayTag server over HTTP', () => {
       body: JSON.stringify({ text: 'still there?', sessionId: sessionA }),
     });
     assert.equal(blocked.status, 403);
+  });
+
+  it('ignores a stale Telegram /on left over from before a restart instead of flipping the tag', async () => {
+    const token = await openOwnerSession();
+    const ownerChatId = '987654321';
+    const saved = await api('/api/owner/tags/tag-default', {
+      method: 'PATCH',
+      token,
+      body: JSON.stringify({
+        telegramEnabled: true,
+        telegramBotToken: '123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw',
+        telegramChatId: ownerChatId,
+      }),
+    });
+    assert.equal(saved.status, 200);
+
+    // Telegram still holds yesterday's /on because the old instance died before acknowledging it.
+    const yesterday = Math.floor(Date.now() / 1000) - 24 * 60 * 60;
+    fs.writeFileSync(
+      telegramUpdatesFile,
+      JSON.stringify([
+        {
+          update_id: 41,
+          message: { message_id: 1, date: yesterday, text: '/on', chat: { id: Number(ownerChatId) }, from: { is_bot: false } },
+        },
+      ])
+    );
+
+    const state = (await (await api('/api/owner/state', { token })).json()) as {
+      tags: { contactEnabled: boolean }[];
+    };
+    assert.equal(state.tags[0].contactEnabled, false);
+    assert.doesNotMatch(fs.readFileSync(telegramSentFile, 'utf8'), /Reachable/);
   });
 });

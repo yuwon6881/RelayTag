@@ -27,6 +27,7 @@ import {
   validateTelegramCredentials,
   formatTelegramRelayPayload,
   parseTelegramUpdateForOwnerReply,
+  isStaleTelegramBacklogUpdate,
   checkDndSpamShield,
   checkTagDndCeiling,
   checkLookupBudget,
@@ -760,18 +761,23 @@ function applyParsedTelegramUpdate(
   store: StoreSchema,
   tag: TagConfig,
   update: TelegramIncomingUpdate,
-  now: number
+  now: number,
+  dropIfStale = false
 ): { applied: boolean; replyMessage?: RelayMessage; dndChanged?: boolean } {
+  if (typeof update.update_id === 'number' && update.update_id > (tag.lastTelegramUpdateId || 0)) {
+    tag.lastTelegramUpdateId = update.update_id;
+  }
+  // Acknowledged (the offset above moves past it) but never acted on.
+  if (dropIfStale && isStaleTelegramBacklogUpdate(update, now)) {
+    return { applied: false };
+  }
+
   const parsed = parseTelegramUpdateForOwnerReply(
     update,
     tag.telegramChatId,
     store.messages,
     tag.id
   );
-
-  if (typeof update.update_id === 'number' && update.update_id > (tag.lastTelegramUpdateId || 0)) {
-    tag.lastTelegramUpdateId = update.update_id;
-  }
 
   if (parsed.action === 'reply') {
     const msgId = `tg-reply-${parsed.updateId || now}`;
@@ -850,9 +856,11 @@ async function syncTelegramBotRepliesIfNeeded(
     let appliedCount = 0;
     let maxUpdateUpdated = false;
     const vehicleDisplay = tag.plateHint || tag.vehicleLabel || tag.code;
+    // Nothing handled yet in this process: this batch may be a backlog from before a restart.
+    const isFirstPollOfProcess = !tag.lastTelegramUpdateId;
     for (const upd of data.result) {
       const prevMax = tag.lastTelegramUpdateId || 0;
-      const outcome = applyParsedTelegramUpdate(store, tag, upd, Date.now());
+      const outcome = applyParsedTelegramUpdate(store, tag, upd, Date.now(), isFirstPollOfProcess);
       if ((tag.lastTelegramUpdateId || 0) > prevMax) {
         maxUpdateUpdated = true;
       }

@@ -743,6 +743,21 @@ export interface TelegramIncomingUpdate {
   };
 }
 
+// After a restart the server has forgotten which Telegram updates it already handled, and
+// Telegram hands back anything not yet acknowledged (up to a day). Replaying an old /on or /dnd
+// would flip the tag on its own, so the first poll of a process ignores updates older than this.
+export const TELEGRAM_BACKLOG_MAX_AGE_MS = 10 * 60 * 1000;
+
+export function isStaleTelegramBacklogUpdate(
+  update: TelegramIncomingUpdate,
+  nowMs: number,
+  maxAgeMs: number = TELEGRAM_BACKLOG_MAX_AGE_MS
+): boolean {
+  const sentAtSeconds = update?.message?.date;
+  if (typeof sentAtSeconds !== 'number' || !Number.isFinite(sentAtSeconds)) return false;
+  return nowMs - sentAtSeconds * 1000 > maxAgeMs;
+}
+
 export type ParsedTelegramAction =
   | {
       action: 'reply';
